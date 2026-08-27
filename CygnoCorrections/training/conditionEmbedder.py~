@@ -1,0 +1,43 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# this is the embedder of the conditions 
+class ConditionEncoder(nn.Module):
+
+    def __init__(
+        self,
+        emb_dim=64
+    ):
+
+        super().__init__()
+
+        self.sim_encoder = nn.Sequential(
+            nn.Linear(3, 64),
+            nn.SiLU(),
+            nn.Linear(64, emb_dim)
+        )
+
+        self.data_encoder = nn.Sequential(
+            nn.Linear(4, 64),
+            nn.SiLU(),
+            nn.Linear(64, emb_dim)
+        )
+
+    def forward(
+        self,
+        sim_cond,
+        data_cond
+    ):
+
+        e_sim = self.sim_encoder(
+            sim_cond
+        )
+
+        e_data = self.data_encoder(
+            data_cond
+        )
+
+        return e_sim, e_data
+
+# this is the CNN encoder (64x64 -> latent)
