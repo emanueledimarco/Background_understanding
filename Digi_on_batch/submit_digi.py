@@ -65,7 +65,7 @@ preserve_relative_paths = True
            cpu=options.threads, user=os.environ['USERNAME'], here=os.environ['PWD'] ) )
     for isrc,src in enumerate(srcFiles):
         print (f"isrcfile = {isrc}, sf={src}")
-        condor_file.write(f'transfer_input_files = {os.path.abspath(options.srcdir)}/build-dir, {os.path.abspath(options.srcdir)}/VignettingMap, {os.path.abspath(cfgFile)}, {os.path.abspath(src)}, /cvmfs/sft-cygno.infn.it/config/lib/s3upload_put.py, {jobdir}/presign_job{isrc}.json\n')
+        condor_file.write(f'transfer_input_files = {os.path.abspath(options.srcdir)}/build-dir, {os.path.abspath(options.srcdir)}/VignettingMap, {os.path.abspath(options.srcdir)}/pmt, {os.path.abspath(cfgFile)}, {os.path.abspath(src)}, /cvmfs/sft-cygno.infn.it/config/lib/s3upload_put.py, {jobdir}/presign_job{isrc}.json\n')
         condor_file.write(f'arguments = {os.path.basename(src)} \nqueue \n\n')
         
     condor_file.close()
@@ -124,6 +124,7 @@ if __name__ == "__main__":
             con_file_name = f"{jobdir}/conf_{a}-{l}.txt"
             os.system(f"cp {args.srcdir}/{args.config} {con_file_name}") 
 
+            replaceParam(con_file_name,"'queue'                 : 0", "queue'                 : 1")
             replaceParam(con_file_name,"'absorption_l'          : 1350.",  f"'absorption_l'          : {Lambda:.0f}")
             replaceParam(con_file_name,"'alpha_G'               : 0.0209", f"'alpha_G'               : {alpha:.3f}")
             #replaceParam(con_file_name,"'events'                : -1",f"'events'                : 10")
