@@ -156,7 +156,6 @@ if __name__ == "__main__":
         json_data = json.load(file)
         
     all_cluster_variables = json_data["all_cluster_variables"]
-    print("List of all the variables that should be attached to the cluster object:   ", all_cluster_variables)
 
     run_inference_friend(
         input_root_file=args.input,
