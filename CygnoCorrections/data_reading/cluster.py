@@ -57,6 +57,8 @@ def select_cluster(c, selection_cfg):
         and selection_cfg["y_min"] < c.ymean < selection_cfg["y_max"]
         and c.n_pixels() > selection_cfg["min_npix"]
         and c.nhits > selection_cfg["n_hits"]
+        and selection_cfg["length_min"] < c.length < selection_cfg["length_max"]
+        and c.width / c.length > selection_cfg["slimness_min"]
     )
 
 def build_clusters_from_event(
