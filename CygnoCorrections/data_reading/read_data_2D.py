@@ -30,7 +30,11 @@ selection_cfg = {
     "y_min": 500,
     "y_max": 2000,
     "min_npix": 500,
-    "n_hits": 200
+    "n_hits": 200,
+    # additional (not used for training)
+    "length_min": 0,
+    "length_max": 1e10,
+    "slimness_min": 0.,
 }
 
 def read_data_and_save(conf):

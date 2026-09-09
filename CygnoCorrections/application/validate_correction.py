@@ -10,7 +10,23 @@ import matplotlib.pyplot as plt
 import uproot
 import torch
 
-from data_reading.read_data_2D import selection_cfg
+selection_cfg = {
+    # used for the training, don't go looser than these
+    "integral_min": 6000, #2000,
+    "integral_max": 50000,
+    "x_min": 500,
+    "x_max": 2000,
+    "y_min": 500,
+    "y_max": 2000,
+    "min_npix": 500,
+    "n_hits": 200,
+
+    # additional
+    "length_min": 0,
+    "length_max": 50,
+    "slimness_min": 0.8,
+}
+
 from data_reading.cluster import build_clusters_from_event
 from training.clusterTraining import compute_physical_scalars_from_image
 
