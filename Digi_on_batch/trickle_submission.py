@@ -104,7 +104,7 @@ def main():
         "-w",
         "--wait-minutes",
         type=float,
-        default=10.0,
+        default=30.0,
         help="Tempo M di attesa in minuti tra un blocco e il successivo (default: 10)",
     )
     parser.add_argument(
