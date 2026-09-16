@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# USAGE: ./submit_digi.py -a 0.021 -l 1350 -o out_giulia_cu -i /cnaf/cygno-sim/Users/dimarcoe/digitune/digi_giulia_cu -s users/dimarcoe/digi/cu_giulia $PWD
+# USAGE: ./submit_trickle_digi.py -a 0.021 -l 1350 -o out_giulia_cu -i /cnaf/cygno-sim/Users/dimarcoe/digitune/digi_giulia_cu -s users/dimarcoe/digi/cu_giulia $PWD
 
 import argparse
 import os
@@ -113,7 +113,7 @@ def submit_condor_job(condor_file_path, ce, dry_run):
     )
     print(f"  [SUBMIT] Invocazione: {cmd}")
 
-    if dry_run==False:
+    if dry_run == False:
         try:
             result = subprocess.run(
                 cmd, shell=True, check=True, text=True, capture_output=True
@@ -204,13 +204,22 @@ if __name__ == "__main__":
         help="Tempo di attesa in minuti tra una sottomissione a blocchi e la successiva",
     )
 
+    # Parametro per specificare da quale directory riprendere la sottomissione
     parser.add_argument(
-        '-d',
-        '--dry-run',
-        action="store_true",
-        help='only print the merge commands, do not execute'
+        "-f",
+        "--start-from",
+        type=str,
+        default=None,
+        help="Pattern della directory da cui ripartire (es. '1_2', '1-2' o 'digi_1-2')",
     )
-    
+
+    parser.add_argument(
+        "-d",
+        "--dry-run",
+        action="store_true",
+        help="only print the merge commands, do not execute",
+    )
+
     args = parser.parse_args()
 
     print("=== SUBMIT DIGI (Sottomissione a Blocchi con Presign Live) ===")
@@ -247,6 +256,36 @@ if __name__ == "__main__":
         for a, alpha in enumerate(args.alphas)
         for l, Lambda in enumerate(args.lambdas)
     ]
+
+    # Gestione della partenza da uno specifico punto (--start-from)
+    if args.start_from:
+        target_indices = re.sub(r"^digi_", "", args.start_from)
+        target_indices = target_indices.replace("_", "-")
+
+        try:
+            target_a, target_l = map(int, target_indices.split("-"))
+        except ValueError:
+            raise RuntimeError(
+                f"ERROR: Formato non valido per --start-from '{args.start_from}'. "
+                f"Usa formati come '1_2', '1-2' oppure 'digi_1-2'."
+            )
+
+        start_index = None
+        for idx, (a, alpha, l, Lambda) in enumerate(param_grid):
+            if a == target_a and l == target_l:
+                start_index = idx
+                break
+
+        if start_index is None:
+            raise RuntimeError(
+                f"ERROR: La combinazione di indici ({target_a}, {target_l}) "
+                f"non è presente nei valori di alpha e lambda correnti."
+            )
+
+        param_grid = param_grid[start_index:]
+        print(
+            f"[INFO] Ripresa sottomissione a partire da digi_{target_a}-{target_l} (index {start_index})"
+        )
 
     total_tasks = len(param_grid)
     print(
@@ -330,5 +369,5 @@ if __name__ == "__main__":
             )
             time.sleep(args.wait_minutes * 60)
 
-    print("\n[COMPLETATO] Tutti i blocchi sono stati creati e sottomessi.")
+    print("\nTutti i blocchi sono stati completati.")
     sys.exit(0)
