@@ -58,12 +58,14 @@ def analyze_mean_vs_event_single_run(
     event_numbers = []
     means = []
 
-    event_count = 0
     mf.jump_to_start()
 
     for mevent in mf:
         if mevent.header.is_midas_internal_event():
             continue
+
+        # Recupero del numero di serie nativo dell'evento MIDAS
+        serial_num = mevent.header.serial_number
 
         img_event = torch.zeros((total_height, width), dtype=torch.float32, device=device)
         mask_event = torch.zeros((total_height, width), dtype=torch.bool, device=device)
@@ -107,10 +109,9 @@ def analyze_mean_vs_event_single_run(
             else:
                 event_mean = 0.0
 
-            event_numbers.append(event_count)
+            # Salviamo il numero di serie invece dell'indice di loop
+            event_numbers.append(serial_num)
             means.append(event_mean)
-
-            event_count += 1
 
     event_numbers = np.array(event_numbers)
     means = np.array(means)
@@ -132,13 +133,13 @@ def analyze_mean_vs_event_single_run(
         cutoff_label = f"{factor:.1f}$\times$Mean = {threshold_val:.2f} ADC/pixel"
 
     spike_mask = means > threshold_val
-    spike_events = event_numbers[spike_mask]
+    spike_events = event_numbers[spike_mask]  # Array dei serial_num da vetare
 
     clean_means = means[~spike_mask]
     clean_avg = np.mean(clean_means) if len(clean_means) > 0 else 0
 
     print(f"\n[ANALISI SPIKE RUN {run_num:05d}] Trovati {len(spike_events)} eventi con carica/pixel > {threshold_val:.2f} ADC/pixel:")
-    print(f"  > Eventi Spike ID: {spike_events.tolist()}")
+    print(f"  > Eventi Spike Serial Number: {spike_events.tolist()}")
     print(f"  > Media prima del veto: {avg_mean:.2f} ADC/pixel")
     print(f"  > Media pulita dopo veto: {clean_avg:.2f} ADC/pixel")
 
@@ -167,8 +168,8 @@ def analyze_mean_vs_event_single_run(
     ax.axhline(clean_avg, color='crimson', linestyle='--', linewidth=1.5, label=f'Clean Mean = {clean_avg:.2f} ADC/pixel')
     ax.axhline(threshold_val, color='orange', linestyle=':', linewidth=1.5, label=f'Veto Cutoff ({cutoff_label})')
 
-    ax.set_title(f"Mean Pixel Charge vs Event Number (Run {run_num:05d})", fontsize=12, fontweight='bold', pad=10)
-    ax.set_xlabel("Event Number", fontsize=12)
+    ax.set_title(f"Mean Pixel Charge vs Event Serial Number (Run {run_num:05d})", fontsize=12, fontweight='bold', pad=10)
+    ax.set_xlabel("Event Serial Number", fontsize=12)
     ax.set_ylabel("Mean ROI Charge [ADC / pixel]", fontsize=12)
     ax.grid(True, linestyle="--", alpha=0.3, color="gray")
     ax.legend(loc='upper right', frameon=True)
@@ -202,7 +203,6 @@ def analyze_mean_vs_event_range(
         tmpdir=tmpdir
     )
 
-    # Ciclo su tutti i run nell'intervallo [run_start, run_end]
     for run_num in range(run_start, run_end + 1):
         analyze_mean_vs_event_single_run(
             run_num=run_num,
@@ -222,7 +222,7 @@ def analyze_mean_vs_event_range(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Analisi medie eventi MIDAS su un range di run e salvataggio veto spikes.")
+    parser = argparse.ArgumentParser(description="Analisi medie eventi MIDAS su un range di run e salvataggio veto spikes usando Serial Number.")
     parser.add_argument("--run-start", type=int, required=True, help="Run iniziale del range")
     parser.add_argument("--run-end", type=int, required=True, help="Run finale del range")
     parser.add_argument("--pedrun", type=int, required=True, help="Numero del run di piedistallo")
