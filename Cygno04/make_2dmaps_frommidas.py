@@ -5,6 +5,7 @@ import ROOT
 import cygno as cy
 import torch
 
+
 def get_device():
     """Rileva e restituisce il device MPS (Metal GPU) su Apple Silicon M4."""
     if torch.backends.mps.is_available():
@@ -125,13 +126,13 @@ def create_2dmaps_from_midas(
     for run_num in range(run_start, run_end + 1):
         print(f"\n---> Elaborazione Run Segnale: {run_num:05d}")
 
-        # Controllo se esiste un file di Veto Eventi per questo specifico run
         veto_set = set()
         veto_file = os.path.join(veto_events_dir, f"spike_events_run{run_num:05d}.npz")
         if os.path.exists(veto_file):
             veto_data = np.load(veto_file)
             veto_set = set(veto_data["veto_events"])
             print(f"  [VETO ATTIVO] Caricati {len(veto_set)} eventi da scartare da: {veto_file}")
+            print(f"  [VETO ID] List: {sorted(list(veto_set))}")
 
         try:
             mf = swift_download_midas_file(run_num, tmpdir, tag)
@@ -147,8 +148,10 @@ def create_2dmaps_from_midas(
             if mevent.header.is_midas_internal_event():
                 continue
 
-            # CONTROLLO VETO EVENTO SPIKE
-            if event_count in veto_set:
+            # CONTROLLO VETO RIGOROSO (SUPPORTA SIA SERIAL NUMBER CHE INDICE LOOP)
+            event_serial = mevent.header.serial_number
+            if (event_serial in veto_set) or (event_count in veto_set):
+                print(f"  [VETO MATCH!] Scartato Evento (Serial: {event_serial}, LoopIdx: {event_count})")
                 skipped_count += 1
                 event_count += 1
                 continue
@@ -182,10 +185,8 @@ def create_2dmaps_from_midas(
                     occupancy_sum[y_start:y_end, :] += valid_mask.to(torch.float32)
 
             event_count += 1
-            if event_count % 10 == 0:
-                print(f"  > Processati {event_count} eventi MIDAS su GPU M4...")
 
-        print(f"Run {run_num} completato: {event_count} eventi totali, {skipped_count} eventi scartati dal veto.")
+        print(f"Run {run_num:05d} completato: {event_count} eventi totali, {skipped_count} eventi SCARTATI dal veto.")
 
     charge_sum_np = charge_sum.cpu().numpy()
     occupancy_sum_np = occupancy_sum.cpu().numpy()
@@ -231,7 +232,7 @@ if __name__ == "__main__":
     parser.add_argument("--nsigma", type=float, default=3.0)
     parser.add_argument("--tag", type=str, default="LNGS")
     parser.add_argument("--tmpdir", type=str, default="/tmp/")
-    parser.add_argument("--veto-events-dir", type=str, default="./veto_events", help="Directory contenente i file .npz degli eventi spike da scartare")
+    parser.add_argument("--veto-events-dir", type=str, default="./veto_events")
 
     args = parser.parse_args()
 
