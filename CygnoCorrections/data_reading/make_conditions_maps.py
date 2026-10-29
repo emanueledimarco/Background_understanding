@@ -5,36 +5,43 @@ import pandas as pd
 from pathlib import Path
 from collections import defaultdict
 
-def make_simulation_map(base_dir="data/sim/recosim_2k",output_file="simulation_map.yaml"):
+def make_simulation_map(base_dir="datacloud/digi_giulia_fe_zcone_zsteps",output_file="simulation_map.yaml"):
     alphas  = np.linspace(0.019,0.023,11)
     lambdas = np.linspace(850,1850,11)
 
-    zpos_dic = {1: "5.0", 2: "15.0", 3: "25.0", 4: "35.0", 5: "46.5"}
+    zpos_dic = {"5": "5.0", "15": "15.0", "25": "25.0", "35": "35.0", "46p5": "46.5"}
 
-    #sim_dict = {}
     sim_dict = defaultdict(list)
-    for a,alpha in enumerate(alphas):
-        for l,Lambda in enumerate(lambdas):
-            for z in range(1,6):
-                # il numero del run e' fittizio (ordine del job di sim). Quindi si deve usare il numero dello step
-                for step in range(1,6):
-                    for d in Path(base_dir).iterdir():
-                        if d.is_dir():
-                            filename = f"{d}/digi_{a}-{l}/iron_step{step}/reco_run0000{z}_3D.root"
-                            if Path(filename).exists():
-                                # remove the files that have only a tiny number of clusters reco (this is a sign of sim/digi/reco problem, not physics)
-                                size_bytes = os.path.getsize(filename)
-                                size_kb = size_bytes / 1024 
-                                if size_kb>100:
-                                    key = f"{zpos_dic[step]},{alpha:.4f},{Lambda:.0f}"
-                                    sim_dict[key].append(filename)
-
+    base_dir = Path(base_dir)
+    
+    for a, alpha in enumerate(alphas):
+        for l, Lambda in enumerate(lambdas):
+            for z_key, z_val in zpos_dic.items():
+                # Costruisce il percorso fino a: .../z15cm_dr/digi_3-5
+                digi_dir = base_dir / f"z{z_key}cm_dr" / f"digi_{a}-{l}"
+                
+                if not digi_dir.is_dir():
+                    continue
+                print(f"Looking for files corresponding to alpha={alpha}, lambda={Lambda}, z={z_val}")
+                
+                # Cerca in tutte le cartelle job_0, job_1, ...
+                for job_dir in digi_dir.glob("job_*"):
+                    if job_dir.is_dir():
+                        filename = job_dir / "reco_run00001_3D.root"
+                        
+                        if filename.exists():
+                            # Controllo dimensione del file in KB (> 100 KB)
+                            size_kb = filename.stat().st_size / 1024
+                            if size_kb > 100:
+                                dict_key = f"{z_val},{alpha:.4f},{Lambda:.0f}"
+                                sim_dict[dict_key].append(str(filename))
+    
     with open(output_file, "w") as f:
         yaml.safe_dump(dict(sim_dict), f, sort_keys=True, default_flow_style=False)
     print (f"===> Output sim map written into {output_file}")
 
 
-def make_data_map(input_csv="data/runs/recodata_run4/calibration.csv",output_file="data_map.yaml"):
+def make_data_map(input_csv="data_reading/calibration.csv",output_file="data_map.yaml"):
     df = pd.read_csv(input_csv, sep=",")
 
     nP = nT = nH = 5
@@ -65,7 +72,7 @@ def make_data_map(input_csv="data/runs/recodata_run4/calibration.csv",output_fil
     print(f"In principle I could select {nz*nP*nT*nH} points, but some bins can be empty, so I selected instead {len(grouped)} combinations of z, P, T, H.")
 
     data_dict = {
-        (float(z), float(round(P.mid,3)), float(round(T.mid,1)), float(round(H.mid,1))): [f"data/runs/recodata_run4/reco_run{int(r)}_3D.root" for r in runs]
+        (float(z), float(round(P.mid,3)), float(round(T.mid,1)), float(round(H.mid,1))): [f"datacloud/runs/recodata_run4/reco_run{int(r)}_3D.root" for r in runs]
         for (z, P, T, H), runs in grouped.items()
     }
 
