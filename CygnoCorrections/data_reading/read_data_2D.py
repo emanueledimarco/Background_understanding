@@ -15,6 +15,14 @@ import yaml
 from yaml import Loader
 import json
 import hashlib
+import urllib.request
+import urllib.error
+
+import concurrent.futures
+import tempfile
+import subprocess
+import hashlib
+import shutil
 
 import torch
 from torch.utils.data import DataLoader
@@ -37,6 +45,68 @@ selection_cfg = {
     "slimness_min": 0.,
 }
 
+def process_single_file_task(root_file, mapkey, all_cluster_variables, isdata, selection_cfg, chunks_dir):
+    """
+    Scarica, processa e salva in cache un singolo file ROOT in modo indipendente.
+    """
+    # Genera un ID univoco per questo specifico file e condizione
+    file_id = hashlib.md5(f"{mapkey}_{root_file}".encode()).hexdigest()
+    chunk_path = os.path.join(chunks_dir, f"chunk_{file_id}.pkl")
+    
+    # 3. [SICUREZZA E RESILIENZA]
+    # Se il chunk esiste già, significa che questo file ROOT era già stato processato con successo in precedenza.
+    if os.path.exists(chunk_path):
+        return mapkey, isdata, chunk_path, root_file
+
+    local_file = root_file
+    tmp_dir = None
+    
+    # Riconosce se è un file remoto o montato. 
+    # Metti a True se vuoi FORZARE sempre la copia in /tmp (consigliato se leggi da un mount di rete lento)
+    force_local_staging = True 
+
+    try:
+        # 1. [OTTIMIZZAZIONE LETTURA] Staging locale
+        if force_local_staging:
+            tmp_dir = tempfile.mkdtemp()
+            # Usa il nome del file originale preso dall'URL
+            local_file = os.path.join(tmp_dir, root_file.split("/")[-1])
+            
+            if root_file.startswith("http://") or root_file.startswith("https://"):
+                # Download diretto ad altissima velocità (ideale per S3 esposto via HTTP)
+                try:
+                    urllib.request.urlretrieve(root_file, local_file)
+                except urllib.error.URLError as e:
+                    raise RuntimeError(f"Impossibile scaricare l'URL S3 {root_file}: {e}")
+            elif ":" in root_file and not root_file.startswith(("C:", "D:")):
+                # Fallback per sintassi rclone "remote:bucket/file"
+                subprocess.run(["rclone", "copyto", root_file, local_file], check=True)
+            else:
+                # Fallback per percorsi di sistema standard
+                shutil.copy2(root_file, local_file)
+            
+        # 2. Processa il file ROOT (ora è sul disco locale e la lettura sarà istantanea)
+        clusters = build_clusters_from_root_file(
+            local_file,
+            scalar_vars=all_cluster_variables,
+            conditions=mapkey,
+            isdata=isdata,
+            selection_cfg=selection_cfg
+        )
+    
+        # Salva il risultato parziale. Se si interrompe ora, al prossimo run ripartirà da qui.
+        with open(chunk_path, "wb") as f:
+            pickle.dump(clusters, f, protocol=4)
+            
+    finally:
+        # Pulizia dello spazio disco: elimina file scaricato e cartella temporanea
+        if force_local_staging and os.path.exists(local_file):
+            os.remove(local_file)
+        if force_local_staging and tmp_dir and os.path.exists(tmp_dir):
+            os.rmdir(tmp_dir)
+
+    return mapkey, isdata, chunk_path, root_file
+
 def read_data_and_save(conf):
 
     #loop to read over network condigurations from the yaml file: - one way to do hyperparameter optimization
@@ -52,48 +122,67 @@ def read_data_and_save(conf):
     print("List of the variables that should be targeted by the flow:   ", target_cluster_variables)
     
     print(f"Now filling the datasets for the simulation and data. It applies the selection and converts them to panda DFs.  Since many files are involved, it takes time...")
-
+    
     cachedir = "data/cache"
+    chunks_dir = os.path.join(cachedir, "chunks")
+    os.makedirs(chunks_dir, exist_ok=True)
+    
     sim_clusters_dict = defaultdict(list)
     data_clusters_dict = defaultdict(list)
     
     sim_map  = dictionary["data_inputs"]["sim_map"]
     data_map = dictionary["data_inputs"]["data_map"]
-
     maps = dict(zip(["sim", "data"], [sim_map, data_map]))
+
+    # Prepara la lista di tutti i task (file singoli)
+    tasks = []
+    
     for k, m in maps.items():
         with open(m) as f:
             raw_map_dic = yaml.safe_load(f)
             
-            # Costruiamo il dizionario controllando le collisioni latenti
             map_dic = {}
             for raw_k, v in raw_map_dic.items():
-                # Arrotondiamo esplicitamente a 4 decimali per evitare cluster float nativi sporchi
                 str_vals = raw_k.split(",")
                 mapkey = tuple(round(float(x), 4) for x in str_vals)
-                
                 if mapkey in map_dic:
-                    print(f"\n[ATTENZIONE CRITICA] Collisione rilevata per la chiave {mapkey}!")
-                    print(f"  -> Stringa YAML precedente associata a: {map_dic[mapkey]}")
-                    print(f"  -> Stringa YAML corrente sovrapposta: {v}")
-                    # Uniamo le liste o lanciamo un errore a seconda della fisica che ti aspetti:
                     map_dic[mapkey].extend(v) 
                 else:
                     map_dic[mapkey] = v
 
-            if k == "sim":
-                print("\t==> Simulation now...")
-                for mapkey, files in map_dic.items():
-                    print(f"mapkey for SIM = {mapkey} | Numero file associati: {len(files)}")
-                    sim_clusters_dict[mapkey] = build_dataset_from_files(
-                        files, all_cluster_variables, mapkey, isdata=False, selection_cfg=selection_cfg
-                    )
-            else:
-                print("\t==> Data now...")
-                for mapkey, files in map_dic.items():
-                    data_clusters_dict[mapkey] = build_dataset_from_files(
-                        files, all_cluster_variables, mapkey, isdata=True, selection_cfg=selection_cfg
-                    )
+            isdata = (k == "data")
+            for mapkey, files in map_dic.items():
+                for root_file in files:
+                    tasks.append((root_file, mapkey, all_cluster_variables, isdata, selection_cfg, chunks_dir))
+
+    print(f"\nAvvio processamento di {len(tasks)} file in parallelo...")
+    
+    # 2. [PARALLELIZZAZIONE]
+    # Modifica max_workers in base al numero di CPU libere e alla RAM.
+    # Inizia con 4 o 8. Se la rete non è satura e hai CPU libere, puoi alzarlo.
+    with concurrent.futures.ProcessPoolExecutor(max_workers=8) as executor:
+        # Sottometti i task
+        futures = {executor.submit(process_single_file_task, *t): t for t in tasks}
+        
+        # Mano a mano che i processi finiscono, uniamo i risultati
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                mapkey, isdata, chunk_path, completed_file = future.result()
+                
+                # Ricarica in memoria il chunk processato dal disco locale
+                with open(chunk_path, "rb") as f:
+                    clusters = pickle.load(f)
+                    
+                if isdata:
+                    data_clusters_dict[mapkey].extend(clusters)
+                else:
+                    sim_clusters_dict[mapkey].extend(clusters)
+                    
+                print(f"Completato: {completed_file} ({len(clusters)} clusters trovati)")
+                
+            except Exception as e:
+                failed_file = futures[future][0]
+                print(f"ERRORE irreversibile nel file {failed_file}:\n{e}")
     
     # save some metadata information
     metadata = {
