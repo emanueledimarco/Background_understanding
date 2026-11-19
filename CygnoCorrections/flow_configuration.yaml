@@ -8,7 +8,7 @@ data_inputs:
     P_ref      : 0.916
     T_ref      : 21.4
     H_ref      : 1.1
-    sim_map    : simulation_map.yaml
+    sim_map    : simulation_map_filtered.yaml
     data_map   : data_map.yaml
     alpha_val  : 0.0202
     lambda_val : 1050

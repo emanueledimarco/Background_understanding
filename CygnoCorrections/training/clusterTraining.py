@@ -386,24 +386,31 @@ def compute_mmd_rbf(X, Y):
         mmd_loss += (term_XX + term_YY - term_XY)
     return torch.clamp(mmd_loss, min=0.0)
 
-def extract_profiles_with_diagonals(img_tensor):
-    B, C, H, W = img_tensor.shape
-    img = img_tensor.view(B, H, W)
-    
-    # Profili X e Y standardizzati (divisi per la lunghezza H o W per coerenza)
-    prof_x = img.mean(dim=1) 
-    prof_y = img.mean(dim=2) 
-    
-    diags_1, diags_2 = [], []
-    img_flipped = torch.flip(img, dims=[2])
-    
+_DIAG_PROJ_CACHE = {}
+
+def get_diag_projection(H, W, device):
+  key = (H, W, device)
+  if key not in _DIAG_PROJ_CACHE:
+    r = torch.arange(H).unsqueeze(1).expand(H, W)
+    c = torch.arange(W).unsqueeze(0).expand(H, W)
+    cols = []
     for offset in range(-H + 1, W):
-        # Usiamo .mean(dim=1) invece di .sum(dim=1) per evitare che 
-        # le diagonali corte contino geometricamente meno a prescindere dal contenuto
-        diags_1.append(torch.diagonal(img, offset=offset, dim1=1, dim2=2).mean(dim=1))
-        diags_2.append(torch.diagonal(img_flipped, offset=offset, dim1=1, dim2=2).mean(dim=1))
-        
-    return torch.cat([prof_x, prof_y, torch.stack(diags_1, dim=1), torch.stack(diags_2, dim=1)], dim=1)
+      m1 = ((c - r) == offset).float().view(-1)
+      cols.append(m1 / m1.sum().clamp(min=1.0))
+    for offset in range(-H + 1, W):
+      m2 = (((W - 1 - c) - r) == offset).float().view(-1)
+      cols.append(m2 / m2.sum().clamp(min=1.0))
+    _DIAG_PROJ_CACHE[key] = torch.stack(cols, dim=1).to(device)
+  return _DIAG_PROJ_CACHE[key]
+
+def extract_profiles_with_diagonals(img_tensor):
+  B, C, H, W = img_tensor.shape
+  img = img_tensor.view(B, H, W)
+  prof_x = img.mean(dim=1)
+  prof_y = img.mean(dim=2)
+  proj = get_diag_projection(H, W, img.device)
+  diags = img.reshape(B, H * W) @ proj
+  return torch.cat([prof_x, prof_y, diags], dim=1)
 
 def compute_radial_profile(img, bins=20):
     # img ha shape [B, C, H, W] oppure [B, H, W]
@@ -458,6 +465,13 @@ def compute_radius_of_gyration(img):
     # 5. Estrazione della radice e squeeze definitivo delle dimensioni flat -> shape [B]
     return torch.sqrt(rg2).squeeze(-1).squeeze(-1)
 
+def wasserstein_1d_loss(pred_vec, target_vec, mode="l1"):
+    p_s, _ = torch.sort(pred_vec.cpu())
+    t_s, _ = torch.sort(target_vec.cpu())
+    loss_fn = F.mse_loss if mode == "mse" else F.l1_loss
+    return loss_fn(p_s, t_s).to(pred_vec.device)
+
+
 # === COMPUTE LOSS ===
 def compute_cygno_loss(
     pred, delta_h, loss_weights, 
@@ -466,15 +480,24 @@ def compute_cygno_loss(
     # 1. CLAMPING REALE DELLE IMMAGINI
     pred_clamped = F.relu(pred)
     data_clamped = F.relu(data_images)
-
+    sim_clamped = F.relu(sim_images) if sim_images is not None else None
+    
     # 2. ESTRAZIONE ONLINE SIMMETRICA (Evita il disallineamento offline/online)
     pred_scalars   = compute_physical_scalars_from_image(pred_clamped)
     target_scalars = compute_physical_scalars_from_image(data_clamped)
 
     # 3. NORMALIZZAZIONE GEOMETRICA PER LE LOSS DI SHAPE 2D
-    pred_n = pred_clamped / (pred_clamped.sum(dim=(-1, -2), keepdim=True) + 1e-8)
-    sim_n  = sim_images / (sim_images.sum(dim=(-1, -2), keepdim=True) + 1e-8) if sim_images is not None else None
-    data_n = data_clamped / (data_clamped.sum(dim=(-1, -2), keepdim=True) + 1e-8)
+    pred_n = pred_clamped / (
+        pred_clamped.sum(dim=(-1, -2), keepdim=True) + 1e-8
+    )
+    sim_n = (
+        sim_clamped / (sim_clamped.sum(dim=(-1, -2), keepdim=True) + 1e-8)
+        if sim_clamped is not None
+        else None
+    )
+    data_n = data_clamped / (
+        data_clamped.sum(dim=(-1, -2), keepdim=True) + 1e-8
+    )
 
     # --- PROFILI GEOMETRICI MMD ---
     L_mmd_shape_1d = compute_mmd_rbf(extract_profiles_with_diagonals(pred_n), extract_profiles_with_diagonals(data_n))
@@ -520,34 +543,32 @@ def compute_cygno_loss(
     L_mmd_physics = compute_mmd_rbf(pred_physics_feat, target_physics_feat)
     
     # 4. FIX SULL'INTEGRALE: Sliced Wasserstein (Sorting Trick) per lo spettro 1D
-    pred_int_sorted, _   = torch.sort(pred_physics_feat[:, 0])
-    target_int_sorted, _ = torch.sort(target_physics_feat[:, 0])
-    L_integral = F.mse_loss(pred_int_sorted, target_int_sorted)
+    L_integral = wasserstein_1d_loss(
+        pred_physics_feat[:, 0], target_physics_feat[:, 0], mode="mse"
+    )
 
     # =====================================================================
     # 5. NUOVO FIX SU GEOMETRIA (Length & Width): Sorting Trick 1D
     # =====================================================================
     # Estrai e ordina la feature 1: Length
-    pred_len_sorted, _   = torch.sort(pred_physics_feat[:, 1])
-    target_len_sorted, _ = torch.sort(target_physics_feat[:, 1])
-    # Nota: F.l1_loss calcola la vera Wasserstein-1, F.mse_loss è legata alla Wasserstein-2.
-    # Per la forma degli istogrammi, l'L1 è spesso più robusta contro gli outlier (i doppi cluster).
-    L_length = F.l1_loss(pred_len_sorted, target_len_sorted)
+    L_length = wasserstein_1d_loss(
+        pred_physics_feat[:, 1], target_physics_feat[:, 1], mode="l1"
+    )
 
     # Estrai e ordina la feature 2: Width
-    pred_wid_sorted, _   = torch.sort(pred_physics_feat[:, 2])
-    target_wid_sorted, _ = torch.sort(target_physics_feat[:, 2])
-    L_width = F.l1_loss(pred_wid_sorted, target_wid_sorted)
+    L_width = wasserstein_1d_loss(
+        pred_physics_feat[:, 2], target_physics_feat[:, 2], mode="l1"
+    )
 
     # --- Sorting su Eccentricity ---
-    pred_ecc_sorted, _   = torch.sort(pred_physics_feat[:, 6])
-    target_ecc_sorted, _ = torch.sort(target_physics_feat[:, 6])
-    L_eccentricity = F.l1_loss(pred_ecc_sorted, target_ecc_sorted)
+    L_eccentricity = wasserstein_1d_loss(
+        pred_physics_feat[:, 6], target_physics_feat[:, 6], mode="l1"
+    )
 
     # --- Sorting su Relative Peak ---
-    pred_peak_sorted, _  = torch.sort(pred_physics_feat[:, 7])
-    target_peak_sorted, _ = torch.sort(target_physics_feat[:, 7])
-    L_rel_peak = F.l1_loss(pred_peak_sorted, target_peak_sorted)
+    L_rel_peak = wasserstein_1d_loss(
+        pred_physics_feat[:, 7], target_physics_feat[:, 7], mode="l1"
+    )
     
     # Combina le loss geometriche 1D
     L_geometry_1d = L_length + L_width + L_eccentricity + L_rel_peak
@@ -593,8 +614,8 @@ def train_epoch(model, loader, optimizer, loss_weights, device="mps", max_batche
         if ibatch % 10 == 0:
             print(f"\t\t  running ibatch {ibatch}...")
 
-        sim_images = batch["sim_images"].to(device)
-        data_images = batch["data_images"].to(device)
+        sim_images = F.relu(batch["sim_images"]).to(device)
+        data_images = F.relu(batch["data_images"]).to(device)
         sim_cond = batch["sim_cond"].to(device)
         data_cond = batch["data_cond"].to(device)
 
@@ -606,31 +627,38 @@ def train_epoch(model, loader, optimizer, loss_weights, device="mps", max_batche
         sim_scalars_phys = compute_physical_scalars_from_image(sim_images_flat).view(B, N, -1)
         data_scalars_phys = compute_physical_scalars_from_image(data_images_flat).view(B, N, -1)
 
+
         optimizer.zero_grad()
         loss_batch_accumulata = 0.0
         info_batch_accumulato = defaultdict(float)
 
         for b in range(B):
-            s_img = sim_images[b].unsqueeze(1)
-            d_img = data_images[b].unsqueeze(1)
-            s_cond = sim_cond[b].unsqueeze(0).repeat(N, 1)
-            d_cond = data_cond[b].unsqueeze(0).repeat(N, 1)
-            s_scal = sim_scalars_phys[b]
-
-            out = model(s_img, s_cond, d_cond, s_scal)
-            pred_img = out["pred_images"]
-            out_identity = model(s_img, s_cond, s_cond, s_scal)
-            
-            loss_evento, info_evento = compute_cygno_loss(
-                pred_img, out["delta_h"], loss_weights,
-                pred_identity=out_identity["pred_images"], sim_images=s_img, data_images=d_img
-            )
-            
-            loss_batch_accumulata += loss_evento / B
-            for k, v in info_evento.items():
-                info_batch_accumulato[k] += v / B
-
-        loss_batch_accumulata.backward()
+          s_img = sim_images[b].unsqueeze(1)
+          d_img = data_images[b].unsqueeze(1)
+          s_cond = sim_cond[b].unsqueeze(0).repeat(N, 1)
+          d_cond = data_cond[b].unsqueeze(0).repeat(N, 1)
+          s_scal = sim_scalars_phys[b]
+     
+          out = model(s_img, s_cond, d_cond, s_scal)
+          pred_img = out["pred_images"]
+          out_identity = model(s_img, s_cond, s_cond, s_scal)
+     
+          loss_evento, info_evento = compute_cygno_loss(
+              pred_img,
+              out["delta_h"],
+              loss_weights,
+              pred_identity=out_identity["pred_images"],
+              sim_images=s_img,
+              data_images=d_img,
+          )
+     
+          # Backward immediato su 1/B: accumula gli stessi gradienti ma libera subito il grafo!
+          (loss_evento / B).backward()
+     
+          loss_batch_accumulata += loss_evento.item() / B
+          for k, v in info_evento.items():
+            info_batch_accumulato[k] += v / B
+     
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
@@ -760,6 +788,8 @@ def train_model(inputfile, outputfile, checkpoint_path=None, epochs=50):
         else "cpu"
     )
 
+    os.makedirs(os.path.dirname(outputfile), exist_ok=True)
+    
     dataset, loader = build_dataloader(
         inputfile
     )
@@ -835,7 +865,7 @@ def train_model(inputfile, outputfile, checkpoint_path=None, epochs=50):
                 f"{v:.4f}"
             )
 
-        if stats["total"] < best_val_loss:
+        if np.isfinite(stats["total"]) and stats["total"] < best_val_loss:
             best_val_loss = stats["total"]
             torch.save({'epoch': epoch,
                         'model_state_dict': model.state_dict(),

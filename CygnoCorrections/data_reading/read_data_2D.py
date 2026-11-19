@@ -31,8 +31,8 @@ from data_reading.cluster import *
 from data_reading.clusterDataset import ConditionalClusterDataset
 
 selection_cfg = {
-    "integral_min": 2000,
-    "integral_max": 50000,
+    "integral_min": 5000,
+    "integral_max": 100000,
     "x_min": 500,
     "x_max": 2000,
     "y_min": 500,
@@ -160,7 +160,7 @@ def read_data_and_save(conf):
     # 2. [PARALLELIZZAZIONE]
     # Modifica max_workers in base al numero di CPU libere e alla RAM.
     # Inizia con 4 o 8. Se la rete non è satura e hai CPU libere, puoi alzarlo.
-    with concurrent.futures.ProcessPoolExecutor(max_workers=8) as executor:
+    with concurrent.futures.ProcessPoolExecutor(max_workers=8,mp_context=multiprocessing.get_context("spawn")) as executor:
         # Sottometti i task
         futures = {executor.submit(process_single_file_task, *t): t for t in tasks}
         

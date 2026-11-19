@@ -1,7 +1,15 @@
+import os
+
+# these are to avoid creash in multithread on mac (2 conflicting libomp in the pool of threads for OpenMP)
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 import numpy as np
 import torch
 import torch.nn as nn
-import ROOT
 import argparse
 
 import yaml

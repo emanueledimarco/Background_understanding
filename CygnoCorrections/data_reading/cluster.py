@@ -75,7 +75,7 @@ def build_clusters_from_event(
     nSc = arrays["nSc"][iev]
 
     for isc in range(nSc):
-
+        
         start = int(arrays["sc_redpixIdx"][iev][isc])
 
         end = (
@@ -83,6 +83,9 @@ def build_clusters_from_event(
             if isc < nSc - 1
             else len(arrays["redpix_ix"][iev])
         )
+
+        if start < 0 or end <= start:
+            continue
 
         ix = arrays["redpix_ix"][iev][start:end]
         iy = arrays["redpix_iy"][iev][start:end]
@@ -180,7 +183,17 @@ def build_clusters_from_root_file(
     tree = f["Events"]
 
     arrays = tree.arrays(library="np")
-
+    branches_to_read = [
+        "nSc",
+        "sc_redpixIdx",
+        "redpix_ix",
+        "redpix_iy",
+        "redpix_iz",
+        "sc_xmean",
+        "sc_ymean",
+    ] + list(scalar_vars)
+    arrays = tree.arrays(branches_to_read, library="np")
+    
     return extract_all_clusters(
         arrays,
         scalar_vars=scalar_vars,
