@@ -58,31 +58,49 @@ def passes_selection_mask(arrays, iev, selection_cfg, has_nredpix):
     return mask, slices
 
 
-def download_s3_to_temp(s3_url, run_num):
+def download_s3_to_temp(s3_url, run_num, max_retries=3):
     """
-    Scarica il file ROOT in streaming sequenziale in /tmp con retry automatici.
+    Scarica il file ROOT in streaming sequenziale in /tmp con retry automatici su errori di connessione.
     """
     session = requests.Session()
     retries = Retry(total=3, backoff_factor=1.0, status_forcelist=[500, 502, 503, 504])
     session.mount("https://", HTTPAdapter(max_retries=retries))
 
-    t0 = time.perf_counter()
-    with session.get(s3_url, stream=True, timeout=(15, 180)) as resp:
-        resp.raise_for_status()
-        tmp = tempfile.NamedTemporaryFile(prefix=f"cygno_run{run_num}_", suffix=".root", delete=False)
+    last_exc = None
+    for attempt in range(1, max_retries + 1):
+        tmp_name = None
+        t0 = time.perf_counter()
         try:
-            with open(tmp.name, "wb") as f_out:
-                shutil.copyfileobj(resp.raw, f_out, length=4 * 1024 * 1024)  # buffer 4 MB
-        except Exception:
-            if os.path.exists(tmp.name):
-                os.remove(tmp.name)
-            raise
+            with session.get(s3_url, stream=True, timeout=(15, 180)) as resp:
+                resp.raise_for_status()
+                tmp = tempfile.NamedTemporaryFile(prefix=f"cygno_run{run_num}_", suffix=".root", delete=False)
+                tmp_name = tmp.name
+                with open(tmp_name, "wb") as f_out:
+                    shutil.copyfileobj(resp.raw, f_out, length=4 * 1024 * 1024)  # buffer 4 MB
 
-    elapsed = time.perf_counter() - t0
-    size_mb = os.path.getsize(tmp.name) / (1024 * 1024)
-    speed = size_mb / elapsed if elapsed > 0 else 0.0
-    print(f"  [Run {run_num}] Scaricato {size_mb:.1f} MB in {elapsed:.1f} s ({speed:.1f} MB/s)")
-    return tmp.name
+            elapsed = time.perf_counter() - t0
+            size_mb = os.path.getsize(tmp_name) / (1024 * 1024)
+            speed = size_mb / elapsed if elapsed > 0 else 0.0
+            print(f"  [Run {run_num}] Scaricato {size_mb:.1f} MB in {elapsed:.1f} s ({speed:.1f} MB/s)")
+            return tmp_name
+        except requests.exceptions.HTTPError as e:
+            if tmp_name and os.path.exists(tmp_name):
+                os.remove(tmp_name)
+            # Se è un 404 non ritentare
+            if resp.status_code == 404:
+                raise
+            last_exc = e
+            if attempt < max_retries:
+                time.sleep(2 * attempt)
+        except Exception as e:
+            if tmp_name and os.path.exists(tmp_name):
+                os.remove(tmp_name)
+            last_exc = e
+            if attempt < max_retries:
+                print(f"  [Run {run_num}] Errore download stream (tentativo {attempt}/{max_retries}): {e}. Riprovo tra {2*attempt}s...")
+                time.sleep(2 * attempt)
+            else:
+                raise last_exc
 
 
 def process_single_run(
@@ -189,6 +207,7 @@ def process_single_run(
 
     except Exception as e:
         print(f"  [ERRORE] Run {run_num}: {e}")
+        raise
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)
@@ -255,6 +274,11 @@ def make_2dmaps_s3_range(
                 occ2d.SetBinContent(ix + 1, iy + 1, vo)
 
     total_entries = float(np.sum(total_occ))
+    if total_entries == 0:
+        print(f"[ERRORE] Nessun cluster valido trovato (total_entries=0) per i run {run_start}-{run_end}.")
+        import sys
+        sys.exit(1)
+
     int2d.SetEntries(total_entries)
     occ2d.SetEntries(total_entries)
 

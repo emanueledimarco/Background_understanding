@@ -11,7 +11,8 @@ def plot_2d_maps(
     output_name=None,
     use_log=False,
     zmin_prof=None, zmax_prof=None,
-    origin='images'
+    origin='images',
+    title=None
 ):
     with uproot.open(input_root_file) as f:
         if origin=='images':
@@ -64,7 +65,8 @@ def plot_2d_maps(
     cbar = fig.colorbar(mesh, ax=ax, pad=0.03, fraction=0.046)
     cbar.set_label("Mean Charge / Hit [ADC]", fontsize=12)
 
-    ax.set_title("Mean Amplitude Profile 2D", fontsize=14, fontweight='bold', pad=10)
+    plot_title = title if title else "Mean Amplitude Profile 2D"
+    ax.set_title(plot_title, fontsize=13, fontweight='bold', pad=10)
     ax.set_xlabel("X [pixel]", fontsize=12)
     ax.set_ylabel("Y [pixel]", fontsize=12)
 
@@ -90,6 +92,7 @@ if __name__ == "__main__":
     # Range asse Z per il Profilo 2D
     parser.add_argument("--zmin-prof", type=float, default=None, help="Z min per Profilo 2D")
     parser.add_argument("--zmax-prof", type=float, default=None, help="Z max per Profilo 2D")
+    parser.add_argument("--title", type=str, default=None, help="Titolo del grafico (opzionale)")
 
     args = parser.parse_args()
 
@@ -102,5 +105,6 @@ if __name__ == "__main__":
         use_log=args.log,
         zmin_prof=args.zmin_prof,
         zmax_prof=args.zmax_prof,
-        origin=origin
+        origin=origin,
+        title=args.title
     )
