@@ -98,12 +98,8 @@ if __name__ == "__main__":
         # 2. Load model
         # -----------------------
         print(f"\nLoading model from:\n{outputmodel}")
-        model = CygnoTransportModel().to(device)
-        state = torch.load(outputmodel, map_location=device)
-        model_state = state['model_state_dict']
-        current_epoch = state['epoch']
-        model.load_state_dict(model_state)
-        print(f"===> Loaded the best model at epoch {current_epoch}.")
+        model = test_training(outputmodel, inputfile)
+        model.eval()
 
         unique_z = sorted(list(set([k[0] for k in metadata["keys"]["data_keys"]])))
         print(f"====> Will make data/MC comparison for these z values: {unique_z}")
