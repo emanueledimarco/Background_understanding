@@ -1,4 +1,6 @@
+#!/usr/bin/env python3
 import os
+import glob
 import argparse
 from collections import deque
 import numpy as np
@@ -9,46 +11,19 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-
-PEDESTAL_REGEX = r"(?:^|[\s_\-])ped(?:estal)?(?:$|[\s_\-])"
-
-
-def get_map_filename(run_min, run_max, vgem, vdrift, source="midas", use_topoveto=False):
-    veto_tag = "_topoveto" if use_topoveto else ""
-    if source == "midas":
-        return f"cygno04_sideA_midas_raw{veto_tag}_VGEM_{vgem}_VD_{vdrift}_run_{run_min}_{run_max}.root"
-    return f"cygno04_sideA_muons_withVignetting{veto_tag}_VGEM_{vgem}_VD_{vdrift}_run_{run_min}_{run_max}.root"
+PED_REGEX = r"\bped(?:estal|s)?\b"
 
 
-def detect_time_column(df, user_col=None):
-    if user_col is not None:
-        if user_col not in df.columns:
-            raise ValueError(f"Colonna '{user_col}' non trovata nel CSV. Colonne disponibili: {list(df.columns)}")
-        return user_col
-
-    candidates = [
-        "start_time", "start-time", "starttime", "Start_Time", "Start-Time",
-        "time_start", "t_start", "timestamp", "time", "date"
-    ]
-    lower_map = {c.lower(): c for c in df.columns}
-    for cand in candidates:
-        if cand.lower() in lower_map:
-            return lower_map[cand.lower()]
-
-    raise ValueError(
-        f"Impossibile individuare automaticamente la colonna start-time. "
-        f"Specificala con --time-col. Colonne disponibili: {list(df.columns)}"
-    )
-
-
-def parse_timestamps(series):
-    numeric = pd.to_numeric(series, errors="coerce")
-    if numeric.notna().sum() == series.notna().sum() and numeric.notna().any():
-        median_val = numeric.dropna().median()
-        unit = "ms" if median_val > 1e11 else "s"
-        return pd.to_datetime(numeric, unit=unit, utc=True)
-
-    return pd.to_datetime(series, errors="coerce", utc=True)
+def save_fig_png_pdf(fig, filepath):
+    base, ext = os.path.splitext(filepath)
+    if ext.lower() not in (".png", ".pdf"):
+        base = filepath
+    os.makedirs(os.path.dirname(os.path.abspath(base)), exist_ok=True)
+    png_path = f"{base}.png"
+    pdf_path = f"{base}.pdf"
+    fig.savefig(png_path, bbox_inches="tight", pad_inches=0.1)
+    fig.savefig(pdf_path, bbox_inches="tight", pad_inches=0.1)
+    return png_path, pdf_path
 
 
 def binary_dilate_2d(mask, radius=1):
@@ -70,7 +45,6 @@ def binary_dilate_2d(mask, radius=1):
 
 
 def find_connected_components(mask):
-    """Restituisce la lista dei componenti connessi (8-connettività) come liste di tuple (ix, iy)."""
     nx, ny = mask.shape
     visited = np.zeros_like(mask, dtype=bool)
     components = []
@@ -106,11 +80,6 @@ def detect_bounded_spark_mask(
     max_grow_radius=4,
     dilate_bins=1,
 ):
-    """
-    Individua le scariche sopra core_thr ed espande ciascuna componente solo entro
-    max_grow_radius bin dal nucleo usando una soglia adattiva al picco locale,
-    evitando di invadere il fondo diffuso normale del rivelatore.
-    """
     core_mask = base_valid & (prof > core_thr)
     if not np.any(core_mask):
         return np.zeros_like(base_valid, dtype=bool)
@@ -150,148 +119,136 @@ def detect_bounded_spark_mask(
 
         grown_union |= comp_grown
 
-    final_mask = binary_dilate_2d(grown_union, radius=dilate_bins) & base_valid
-    return final_mask
+    return binary_dilate_2d(grown_union, radius=dilate_bins) & base_valid
 
 
-def save_dynamic_spark_check(
-    run_label,
-    prof,
-    x_edges,
-    y_edges,
-    base_valid,
-    dynamic_veto_mask,
-    clean_valid,
-    threshold,
-    check_dir,
-):
-    os.makedirs(check_dir, exist_ok=True)
-    out_png = os.path.join(check_dir, f"spark_clean_{run_label}.png")
-
-    prof_before = np.where(base_valid, prof, np.nan).T
-    prof_after = np.where(clean_valid, prof, np.nan).T
-    veto_overlay = np.where(dynamic_veto_mask, 1.0, np.nan).T
-
-    max_before = float(np.nanmax(prof_before)) if np.any(base_valid) else 0.0
-    max_after = float(np.nanmax(prof_after)) if np.any(clean_valid) else 0.0
-    n_removed = int(np.sum(dynamic_veto_mask))
-
-    fig, axes = plt.subplots(1, 3, figsize=(17, 8.5), dpi=150)
-
-    m0 = axes[0].pcolormesh(x_edges, y_edges, prof_before, shading="flat", cmap="rainbow")
-    cb0 = fig.colorbar(m0, ax=axes[0], pad=0.02, fraction=0.046)
-    cb0.set_label("Mean Charge / Hit [ADC]", fontsize=10)
-    axes[0].set_title(f"1. Prima (max={max_before:.0f} ADC)", fontsize=11, fontweight="bold")
-
-    axes[1].pcolormesh(x_edges, y_edges, prof_after, shading="flat", cmap="Greys", alpha=0.55)
-    axes[1].pcolormesh(x_edges, y_edges, veto_overlay, shading="flat", cmap="autumn", vmin=0, vmax=1, alpha=0.95)
-    axes[1].set_title(f"2. Spike rimossa ({n_removed} bin | thr={threshold:.1f})", fontsize=11, fontweight="bold")
-
-    m2 = axes[2].pcolormesh(x_edges, y_edges, prof_after, shading="flat", cmap="rainbow")
-    cb2 = fig.colorbar(m2, ax=axes[2], pad=0.02, fraction=0.046)
-    cb2.set_label("Mean Charge / Hit [ADC]", fontsize=10)
-    axes[2].set_title(f"3. Dopo pulizia (max={max_after:.0f} ADC)", fontsize=11, fontweight="bold")
-
-    for ax in axes:
-        ax.set_aspect("equal")
-        ax.set_xlabel("X [pixel]", fontsize=10)
-        ax.grid(True, linestyle="--", alpha=0.3, color="gray")
-    axes[0].set_ylabel("Y [pixel]", fontsize=10)
-
-    fig.suptitle(f"Rimozione dinamica spike — {run_label}", fontsize=13, fontweight="bold")
-    plt.tight_layout()
-    plt.savefig(out_png, bbox_inches="tight", pad_inches=0.1)
-    plt.close(fig)
+def parse_z_max_arg(z_max_str):
+    if z_max_str is None:
+        return "auto"
+    val = str(z_max_str).strip().lower()
+    if val in ("auto", "mean"):
+        return "auto"
+    if val in ("free", "none", "off"):
+        return None
+    num = float(val)
+    return num if num > 0 else None
 
 
-def find_consecutive_run_ranges_with_time(df, split_by_desc=False):
-    if df.empty:
-        return []
+def detect_time_column(df, user_time_col=None):
+    if user_time_col is not None:
+        if user_time_col not in df.columns:
+            raise ValueError(f"Colonna tempo '{user_time_col}' non trovata nel CSV. Colonne: {list(df.columns)}")
+        return user_time_col
 
-    df = df.sort_values("run_number").reset_index(drop=True)
+    candidates = [
+        "start_time", "start-time", "starttime", "start_date", "startdate",
+        "timestamp", "time_start", "begin_time", "time", "date", "datetime",
+    ]
+    lower_map = {c.strip().lower(): c for c in df.columns}
+    for cand in candidates:
+        if cand in lower_map:
+            return lower_map[cand]
+    for col in df.columns:
+        if "start" in col.lower() and ("time" in col.lower() or "date" in col.lower()):
+            return col
+    return None
 
-    ranges = []
-    current_start = df.loc[0, "run_number"]
-    current_end = df.loc[0, "run_number"]
-    current_vgem = df.loc[0, "GEM1_V"]
-    current_vdrift = df.loc[0, "DRIFT_V"]
-    first_desc = str(df.loc[0, "run_description"]) if "run_description" in df.columns else ""
-    current_descs = [first_desc] if first_desc else []
-    current_t_start = df.loc[0, "_parsed_time"]
-    current_t_end = df.loc[0, "_parsed_time"]
 
-    for i in range(1, len(df)):
-        row = df.loc[i]
-        run_num = row["run_number"]
-        vgem = row["GEM1_V"]
-        vdrift = row["DRIFT_V"]
-        desc = str(row["run_description"]) if "run_description" in df.columns else ""
-        t_run = row["_parsed_time"]
+def parse_timestamps(series):
+    numeric = pd.to_numeric(series, errors="coerce")
+    if numeric.notna().sum() == len(series) and len(series) > 0:
+        med = float(numeric.median())
+        if med > 1e14:
+            return pd.to_datetime(numeric, unit="ns", utc=True)
+        if med > 1e11:
+            return pd.to_datetime(numeric, unit="ms", utc=True)
+        return pd.to_datetime(numeric, unit="s", utc=True)
+    return pd.to_datetime(series, errors="coerce", utc=True)
 
-        same_desc = (desc == current_descs[-1]) if (split_by_desc and current_descs) else True
 
-        if (run_num == current_end + 1) and (vgem == current_vgem) and (vdrift == current_vdrift) and same_desc:
-            current_end = run_num
-            if desc and desc not in current_descs:
-                current_descs.append(desc)
-            if pd.notnull(t_run):
-                current_t_end = t_run
-        else:
-            ranges.append({
-                "run_min": int(current_start),
-                "run_max": int(current_end),
-                "vgem": int(current_vgem) if pd.notnull(current_vgem) else current_vgem,
-                "vdrift": int(current_vdrift) if pd.notnull(current_vdrift) else current_vdrift,
-                "run_description": " | ".join(current_descs),
-                "t_start": current_t_start,
-                "t_end": current_t_end,
+def build_run_blocks(df_filtered, mode="per-run"):
+    df_s = df_filtered.sort_values("run_number").reset_index(drop=True)
+    blocks = []
+
+    if mode == "per-run":
+        for _, row in df_s.iterrows():
+            rnum = int(row["run_number"])
+            blocks.append({
+                "run_min": rnum,
+                "run_max": rnum,
+                "vgem": row.get("GEM1_V", np.nan),
+                "vdrift": row.get("DRIFT_V", np.nan),
+                "run_description": str(row.get("run_description", "")).strip(),
+                "t_start": row["_parsed_time"],
+                "t_end": row["_parsed_time"],
             })
-            current_start = run_num
-            current_end = run_num
-            current_vgem = vgem
-            current_vdrift = vdrift
-            current_descs = [desc] if desc else []
-            current_t_start = t_run
-            current_t_end = t_run
+        return blocks
 
-    ranges.append({
-        "run_min": int(current_start),
-        "run_max": int(current_end),
-        "vgem": int(current_vgem) if pd.notnull(current_vgem) else current_vgem,
-        "vdrift": int(current_vdrift) if pd.notnull(current_vdrift) else current_vdrift,
-        "run_description": " | ".join(current_descs),
-        "t_start": current_t_start,
-        "t_end": current_t_end,
-    })
+    current = None
+    for _, row in df_s.iterrows():
+        rnum = int(row["run_number"])
+        vgem = row.get("GEM1_V", np.nan)
+        vdrift = row.get("DRIFT_V", np.nan)
+        desc = str(row.get("run_description", "")).strip()
+        ts = row["_parsed_time"]
 
-    return ranges
-
-
-def get_per_run_ranges_with_time(df):
-    if df.empty:
-        return []
-
-    df = df.sort_values("run_number").reset_index(drop=True)
-    ranges = []
-    for _, row in df.iterrows():
-        run_num = int(row["run_number"])
-        vgem = int(row["GEM1_V"]) if pd.notnull(row["GEM1_V"]) else row["GEM1_V"]
-        vdrift = int(row["DRIFT_V"]) if pd.notnull(row["DRIFT_V"]) else row["DRIFT_V"]
-        desc = str(row["run_description"]) if "run_description" in df.columns else ""
-        t_run = row["_parsed_time"]
-        ranges.append({
-            "run_min": run_num,
-            "run_max": run_num,
-            "vgem": vgem,
-            "vdrift": vdrift,
-            "run_description": desc,
-            "t_start": t_run,
-            "t_end": t_run,
-        })
-    return ranges
+        same_cfg = (
+            current is not None
+            and rnum == current["run_max"] + 1
+            and np.isclose(vgem, current["vgem"], equal_nan=True)
+            and np.isclose(vdrift, current["vdrift"], equal_nan=True)
+            and desc == current["run_description"]
+        )
+        if same_cfg:
+            current["run_max"] = rnum
+            if pd.notna(ts):
+                current["t_end"] = ts
+        else:
+            if current is not None:
+                blocks.append(current)
+            current = {
+                "run_min": rnum,
+                "run_max": rnum,
+                "vgem": vgem,
+                "vdrift": vdrift,
+                "run_description": desc,
+                "t_start": ts,
+                "t_end": ts,
+            }
+    if current is not None:
+        blocks.append(current)
+    return blocks
 
 
-def compute_xy_mean_from_root(
+def find_root_file_for_block(output_dir, source, block, use_topoveto=False):
+    r0, r1 = block["run_min"], block["run_max"]
+    vgem, vdrift = block["vgem"], block["vdrift"]
+
+    veto_tag = "_topoveto" if use_topoveto else ""
+    vgem_str = f"{int(vgem)}" if pd.notna(vgem) and float(vgem).is_integer() else f"{vgem}"
+    vd_str = f"{int(vdrift)}" if pd.notna(vdrift) and float(vdrift).is_integer() else f"{vdrift}"
+
+    if source == "midas":
+        exact = os.path.join(output_dir, f"cygno04_sideA_midas_raw{veto_tag}_VGEM_{vgem_str}_VD_{vd_str}_run_{r0}_{r1}.root")
+    else:
+        exact = os.path.join(output_dir, f"cygno04_sideA_muons_withVignetting{veto_tag}_VGEM_{vgem_str}_VD_{vd_str}_run_{r0}_{r1}.root")
+
+    if os.path.exists(exact) and os.path.getsize(exact) > 0:
+        return exact
+
+    matches = sorted(glob.glob(os.path.join(output_dir, f"*_run_{r0}_{r1}.root")))
+    matches = [
+        m for m in matches
+        if "_bare_" not in os.path.basename(m)
+        and not m.endswith("_clean.root")
+        and os.path.getsize(m) > 0
+    ]
+    if matches:
+        return matches[0]
+    return None
+
+
+def load_and_clean_map(
     root_path,
     source="midas",
     topo_veto_mask=None,
@@ -304,46 +261,44 @@ def compute_xy_mean_from_root(
     spark_ratio=None,
     spark_abs=None,
     spark_dilate=1,
-    spark_check_dir=None,
-    run_label=None,
 ):
     with uproot.open(root_path) as f:
         if source == "midas":
             prof_key = "prof2d_images" if "prof2d_images" in f else "prof2d"
+            int_key = "int2d_images" if "int2d_images" in f else "int2d"
             occ_key = "occ2d_images" if "occ2d_images" in f else "occ2d"
         else:
-            prof_key = "prof2d"
-            occ_key = "occ2d"
+            prof_key, int_key, occ_key = "prof2d", "int2d", "occ2d"
 
         prof, x_edges, y_edges = f[prof_key].to_numpy()
+        integ = f[int_key].values()
         occ = f[occ_key].values()
 
-    valid = (occ > 0) & np.isfinite(prof)
+    base_valid = (occ > 0) & np.isfinite(prof)
+    if topo_veto_mask is not None:
+        if topo_veto_mask.shape != prof.shape:
+            raise ValueError(f"Shape topo_veto_mask {topo_veto_mask.shape} != prof {prof.shape}")
+        base_valid &= (~topo_veto_mask)
 
     if edge_margin is not None and edge_margin > 0:
         x_centers = 0.5 * (x_edges[:-1] + x_edges[1:])
         y_centers = 0.5 * (y_edges[:-1] + y_edges[1:])
         x_in = (x_centers >= (x_edges[0] + edge_margin)) & (x_centers <= (x_edges[-1] - edge_margin))
         y_in = (y_centers >= (y_edges[0] + edge_margin)) & (y_centers <= (y_edges[-1] - edge_margin))
-        valid &= np.outer(x_in, y_in)
+        base_valid &= np.outer(x_in, y_in)
 
-    if topo_veto_mask is not None:
-        if topo_veto_mask.shape != valid.shape:
-            raise ValueError(f"Shape veto_mask {topo_veto_mask.shape} incompatibile con mappa {valid.shape}")
-        valid &= (~topo_veto_mask)
-
-    base_valid = valid.copy()
-    max_before = float(np.max(prof[base_valid])) if np.any(base_valid) else np.nan
-    n_dyn_vetoed = 0
+    max_before_clean = float(np.max(prof[base_valid])) if np.any(base_valid) else np.nan
+    dyn_veto_mask = np.zeros_like(base_valid, dtype=bool)
+    core_thr = np.nan
 
     if dynamic_spark_veto and np.any(base_valid):
-        prof_active = prof[base_valid]
-        median_val = float(np.median(prof_active))
-        mad_val = float(np.median(np.abs(prof_active - median_val)))
+        vals = prof[base_valid]
+        median_val = float(np.median(vals))
+        mad_val = float(np.median(np.abs(vals - median_val)))
         robust_std = 1.4826 * mad_val
         if robust_std <= 0:
-            q75, q25 = np.percentile(prof_active, [75, 25])
-            robust_std = float((q75 - q25) / 1.349) if q75 > q25 else float(np.std(prof_active))
+            q75, q25 = np.percentile(vals, [75, 25])
+            robust_std = float((q75 - q25) / 1.349) if q75 > q25 else float(np.std(vals))
 
         if spark_abs is not None:
             core_thr = float(spark_abs)
@@ -360,7 +315,7 @@ def compute_xy_mean_from_root(
             core_thr = min(core_thr, float(spark_hard_cap))
             base_skirt_thr = min(base_skirt_thr, core_thr)
 
-        dyn_mask = detect_bounded_spark_mask(
+        dyn_veto_mask = detect_bounded_spark_mask(
             prof=prof,
             base_valid=base_valid,
             core_thr=core_thr,
@@ -370,397 +325,443 @@ def compute_xy_mean_from_root(
             dilate_bins=spark_dilate,
         )
 
-        # Rete di sicurezza assoluta per singoli pixel/micro-spark sopra spark_hard_cap
         if has_hard_cap:
-            hard_cap_hits = base_valid & (prof > float(spark_hard_cap))
-            if np.any(hard_cap_hits):
-                dyn_mask |= binary_dilate_2d(hard_cap_hits, radius=spark_dilate) & base_valid
+            hard_hits = base_valid & (prof > float(spark_hard_cap))
+            if np.any(hard_hits):
+                dyn_veto_mask |= binary_dilate_2d(hard_hits, radius=spark_dilate) & base_valid
 
-        if np.any(dyn_mask):
-            n_dyn_vetoed = int(np.sum(dyn_mask))
-            valid &= (~dyn_mask)
+    clean_valid = base_valid & (~dyn_veto_mask)
+    n_active = int(np.sum(clean_valid))
 
-            label = run_label or os.path.splitext(os.path.basename(root_path))[0]
-            max_after_tmp = float(np.max(prof[valid])) if np.any(valid) else np.nan
-            cap_str = f", cap={float(spark_hard_cap):.0f}" if has_hard_cap else ""
-            print(
-                f"  [DYNAMIC SPARK VETO] {label}: rimossi {n_dyn_vetoed} bin "
-                f"(thr={core_thr:.1f}{cap_str} ADC | max: {max_before:.1f} -> {max_after_tmp:.1f} ADC)"
-            )
-            if spark_check_dir:
-                save_dynamic_spark_check(
-                    run_label=label,
-                    prof=prof,
-                    x_edges=x_edges,
-                    y_edges=y_edges,
-                    base_valid=base_valid,
-                    dynamic_veto_mask=dyn_mask,
-                    clean_valid=valid,
-                    threshold=core_thr,
-                    check_dir=spark_check_dir,
-                )
+    if n_active > 0:
+        prof_v = prof[clean_valid]
+        int_v = integ[clean_valid]
+        occ_v = occ[clean_valid]
 
-    n_active = int(np.sum(valid))
-
-    if n_active == 0:
-        return {
-            "mean_xy": np.nan,
-            "std_xy": np.nan,
-            "sem_xy": np.nan,
-            "integral_xy": 0.0,
-            "active_bins": 0,
-            "dynamic_veto_bins": n_dyn_vetoed,
-            "max_before_clean": max_before,
-            "max_after_clean": np.nan,
-        }
-
-    prof_valid = prof[valid]
-    mean_xy = float(np.mean(prof_valid))
-    std_xy = float(np.std(prof_valid, ddof=1)) if n_active > 1 else 0.0
-    sem_xy = float(std_xy / np.sqrt(n_active))
-    integral_xy = float(np.sum(prof_valid))
-    max_after = float(np.max(prof_valid))
+        mean_xy = float(np.mean(prof_v))
+        std_xy = float(np.std(prof_v, ddof=1)) if n_active > 1 else 0.0
+        sem_xy = float(std_xy / np.sqrt(n_active))
+        tot_occ = float(np.sum(occ_v))
+        weighted_mean_xy = float(np.sum(int_v) / tot_occ) if tot_occ > 0 else np.nan
+        integral_xy = float(np.sum(prof_v))
+        max_after_clean = float(np.max(prof_v))
+    else:
+        mean_xy = np.nan
+        sem_xy = np.nan
+        weighted_mean_xy = np.nan
+        integral_xy = 0.0
+        max_after_clean = np.nan
 
     return {
+        "prof": prof,
+        "x_edges": x_edges,
+        "y_edges": y_edges,
+        "base_valid": base_valid,
+        "dyn_veto_mask": dyn_veto_mask,
+        "clean_valid": clean_valid,
+        "core_thr": core_thr,
         "mean_xy": mean_xy,
-        "std_xy": std_xy,
         "sem_xy": sem_xy,
+        "weighted_mean_xy": weighted_mean_xy,
         "integral_xy": integral_xy,
         "active_bins": n_active,
-        "dynamic_veto_bins": n_dyn_vetoed,
-        "max_before_clean": max_before,
-        "max_after_clean": max_after,
+        "dynamic_veto_bins": int(np.sum(dyn_veto_mask)),
+        "max_before_clean": max_before_clean,
+        "max_after_clean": max_after_clean,
     }
 
 
-def analyze_and_plot(
-    csv_file,
-    source="midas",
-    topo_veto_file=None,
-    edge_margin=100.0,
-    dynamic_spark_veto=True,
-    spark_nsigma=20.0,
-    spark_skirt_nsigma=12.0,
-    spark_max_radius=4,
-    spark_hard_cap=150.0,
-    spark_ratio=None,
-    spark_abs=None,
-    spark_dilate=1,
-    spark_check_dir=None,
-    run_description=None,
-    exclude_pedestals=True,
-    group_by_desc=False,
-    run_min=None,
-    run_max=None,
-    file_s3_tag="LNGS",
-    mode="per-run",
-    output_dir=".",
-    summary_csv="xy_mean_summary.csv",
-    plot_output="trend_integral.png",
-    time_col=None,
-    time_unit="hours",
+def save_2d_map_plot(
+    map_data,
+    title,
+    out_base,
+    z_min=0.0,
+    z_max=None,
 ):
-    print(f"\n========================================================")
-    print(f"ANALISI TEMPORALE E PLOT MEDIA IN (X, Y) [source={source}]")
-    print(f"========================================================")
+    prof_clean = np.where(map_data["clean_valid"], map_data["prof"], np.nan).T
+    x_edges = map_data["x_edges"]
+    y_edges = map_data["y_edges"]
 
-    if edge_margin is not None and edge_margin > 0:
-        print(f"--> Esclusione bordi esterni attiva: {edge_margin:.0f} pixel per lato")
+    vmax_eff = z_max if (z_max is not None and np.isfinite(z_max) and z_max > z_min) else None
+
+    fig, ax = plt.subplots(figsize=(7.2, 9.2), dpi=150)
+    mesh = ax.pcolormesh(
+        x_edges,
+        y_edges,
+        prof_clean,
+        shading="flat",
+        cmap="rainbow",
+        vmin=z_min,
+        vmax=vmax_eff,
+    )
+    cb = fig.colorbar(mesh, ax=ax, pad=0.02, fraction=0.046)
+    cb.set_label("Mean Charge / Hit [ADC]", fontsize=10)
+
+    max_val = map_data["max_after_clean"]
+    mean_val = map_data["mean_xy"]
+    zmax_label = f"{vmax_eff:.1f}" if vmax_eff is not None else "auto"
+    ax.set_title(
+        f"{title}\nmean={mean_val:.2f} ADC | max={max_val:.1f} ADC | zmax={zmax_label}",
+        fontsize=10.5,
+        fontweight="bold",
+    )
+    ax.set_aspect("equal")
+    ax.set_xlabel("X [pixel]", fontsize=10)
+    ax.set_ylabel("Y [pixel]", fontsize=10)
+    ax.grid(True, linestyle="--", alpha=0.3, color="gray")
+
+    plt.tight_layout()
+    save_fig_png_pdf(fig, out_base)
+    plt.close(fig)
+
+
+def save_spark_check_plot(
+    map_data,
+    run_label,
+    check_dir,
+    z_min=0.0,
+    z_max=None,
+):
+    out_base = os.path.join(check_dir, f"spark_check_{run_label}")
+
+    x_edges = map_data["x_edges"]
+    y_edges = map_data["y_edges"]
+    prof_before = np.where(map_data["base_valid"], map_data["prof"], np.nan).T
+    prof_after = np.where(map_data["clean_valid"], map_data["prof"], np.nan).T
+    veto_overlay = np.where(map_data["dyn_veto_mask"], 1.0, np.nan).T
+
+    vmax_clean = z_max if (z_max is not None and np.isfinite(z_max) and z_max > z_min) else None
+
+    fig, axes = plt.subplots(1, 3, figsize=(17, 8.5), dpi=150)
+
+    m0 = axes[0].pcolormesh(x_edges, y_edges, prof_before, shading="flat", cmap="rainbow")
+    cb0 = fig.colorbar(m0, ax=axes[0], pad=0.02, fraction=0.046)
+    cb0.set_label("Mean Charge / Hit [ADC]", fontsize=10)
+    axes[0].set_title(f"1. Prima pulizia prof2d (max={map_data['max_before_clean']:.0f} ADC)", fontsize=11, fontweight="bold")
+
+    axes[1].pcolormesh(x_edges, y_edges, prof_after, shading="flat", cmap="Greys", alpha=0.55)
+    axes[1].pcolormesh(x_edges, y_edges, veto_overlay, shading="flat", cmap="autumn", vmin=0, vmax=1, alpha=0.95)
+    axes[1].set_title(
+        f"2. Spike rimosse ({map_data['dynamic_veto_bins']} bin | thr={map_data['core_thr']:.1f})",
+        fontsize=11,
+        fontweight="bold",
+    )
+
+    m2 = axes[2].pcolormesh(
+        x_edges,
+        y_edges,
+        prof_after,
+        shading="flat",
+        cmap="rainbow",
+        vmin=z_min,
+        vmax=vmax_clean,
+    )
+    cb2 = fig.colorbar(m2, ax=axes[2], pad=0.02, fraction=0.046)
+    cb2.set_label("Mean Charge / Hit [ADC]", fontsize=10)
+    axes[2].set_title(f"3. Mappa pulita (max={map_data['max_after_clean']:.1f} ADC)", fontsize=11, fontweight="bold")
+
+    for ax in axes:
+        ax.set_aspect("equal")
+        ax.set_xlabel("X [pixel]", fontsize=10)
+        ax.grid(True, linestyle="--", alpha=0.3, color="gray")
+    axes[0].set_ylabel("Y [pixel]", fontsize=10)
+
+    fig.suptitle(f"Pulizia dinamica prof2d — {run_label}", fontsize=13, fontweight="bold")
+    plt.tight_layout()
+    save_fig_png_pdf(fig, out_base)
+    plt.close(fig)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Calcola la history temporale dell'integrale medio in (x, y) e genera le mappe 2D.")
+    parser.add_argument("--csv", type=str, required=True, help="CSV dei run")
+    parser.add_argument("--source", type=str, choices=["midas", "reco"], default="midas")
+    parser.add_argument("--file-s3-tag", type=str, default="LNGS")
+    parser.add_argument("--run-min", type=int, default=None)
+    parser.add_argument("--run-max", type=int, default=None)
+    parser.add_argument("--run-description", type=str, nargs="*", default=None)
+    parser.add_argument("--include-pedestals", action="store_true")
+    parser.add_argument("--group-by-desc", action="store_true")
+    parser.add_argument("--mode", type=str, choices=["per-run", "consecutive"], default="per-run")
+
+    parser.add_argument("--output-dir", type=str, default=".")
+    parser.add_argument("--summary-csv", type=str, default="xy_mean_summary.csv")
+    parser.add_argument("--plot-output", type=str, default="trend_integral.png")
+    parser.add_argument("--plot-2dmaps", action="store_true", help="Salva i plot 2D PNG e PDF per ciascun run")
+    parser.add_argument("--plots-2d-dir", type=str, default="plots_2d", help="Cartella di output per le mappe 2D")
+    parser.add_argument("--z-min", type=float, default=0.0, help="Limite inferiore scala colori Z delle mappe 2D (default: 0.0)")
+    parser.add_argument(
+        "--z-max",
+        type=str,
+        default="auto",
+        help="Limite superiore scala colori Z delle mappe 2D: 'auto' (media dei max_after_clean, default), valore numerico (es. 55.0), o 'free'",
+    )
+
+    parser.add_argument("--topo-veto-file", type=str, default=None)
+    parser.add_argument("--edge-margin", type=float, default=100.0)
+    parser.add_argument("--no-dynamic-spark-veto", action="store_true")
+    parser.add_argument("--spark-nsigma", type=float, default=20.0)
+    parser.add_argument("--spark-skirt-nsigma", type=float, default=12.0)
+    parser.add_argument("--spark-max-radius", type=int, default=4)
+    parser.add_argument("--spark-hard-cap", type=float, default=150.0)
+    parser.add_argument("--spark-ratio", type=float, default=None)
+    parser.add_argument("--spark-abs", type=float, default=None)
+    parser.add_argument("--spark-dilate", type=int, default=1)
+    parser.add_argument("--spark-check-dir", type=str, default=None)
+
+    parser.add_argument("--time-col", type=str, default=None)
+    parser.add_argument("--time-unit", type=str, choices=["seconds", "hours", "days"], default="hours")
+
+    args = parser.parse_args()
+    z_max_cfg = parse_z_max_arg(args.z_max)
 
     topo_veto_mask = None
-    use_topoveto = topo_veto_file is not None
-    if use_topoveto:
-        if not os.path.exists(topo_veto_file):
-            raise FileNotFoundError(f"File veto topologico non trovato: {topo_veto_file}")
-        topo_veto_mask = np.load(topo_veto_file)["veto_mask"].astype(bool)
-        print(f"--> Veto topologico statico attivo: {topo_veto_file} ({int(np.sum(topo_veto_mask))} bin esclusi)")
+    if args.topo_veto_file is not None:
+        if not os.path.exists(args.topo_veto_file):
+            raise FileNotFoundError(f"File veto topologico non trovato: {args.topo_veto_file}")
+        topo_veto_mask = np.load(args.topo_veto_file)["veto_mask"].astype(bool)
 
-    if dynamic_spark_veto:
-        cap_msg = f", hard_cap={spark_hard_cap:.0f} ADC" if (spark_hard_cap is not None and spark_hard_cap > 0) else ""
-        print(
-            f"--> Rimozione dinamica spike su prof2d ATTIVA "
-            f"(nsigma={spark_nsigma}, skirt={spark_skirt_nsigma}, max_radius={spark_max_radius}, dilate={spark_dilate}{cap_msg})"
-        )
-
-    df = pd.read_csv(csv_file)
-    df["run_description"] = df["run_description"].astype(str).str.strip()
-    df["file_s3_tag"] = df["file_s3_tag"].astype(str).str.strip()
+    df = pd.read_csv(args.csv)
     df["run_number"] = pd.to_numeric(df["run_number"], errors="coerce")
-    df["GEM1_V"] = pd.to_numeric(df["GEM1_V"], errors="coerce")
-    df["DRIFT_V"] = pd.to_numeric(df["DRIFT_V"], errors="coerce")
+    df = df.dropna(subset=["run_number"]).copy()
+    df["run_number"] = df["run_number"].astype(int)
 
-    mask = pd.Series(True, index=df.index)
-    if file_s3_tag:
-        mask &= (df["file_s3_tag"] == file_s3_tag.strip())
-    if run_min is not None:
-        mask &= (df["run_number"] >= run_min)
-    if run_max is not None:
-        mask &= (df["run_number"] <= run_max)
+    if "file_s3_tag" in df.columns and args.file_s3_tag:
+        df["file_s3_tag"] = df["file_s3_tag"].astype(str).str.strip()
+        df = df[df["file_s3_tag"] == args.file_s3_tag].copy()
 
-    if run_description is not None:
-        if isinstance(run_description, str):
-            if run_description.lower() == "all":
-                pass
-            elif "," in run_description:
-                descs = [d.strip() for d in run_description.split(",") if d.strip()]
-                mask &= df["run_description"].isin(descs)
-            else:
-                mask &= (df["run_description"] == run_description.strip())
-        elif isinstance(run_description, (list, tuple)):
-            descs = [str(d).strip() for d in run_description if str(d).strip()]
-            mask &= df["run_description"].isin(descs)
-    elif exclude_pedestals:
-        is_ped = df["run_description"].str.contains(PEDESTAL_REGEX, case=False, regex=True, na=False)
-        mask &= (~is_ped)
+    if "run_description" in df.columns:
+        df["run_description"] = df["run_description"].astype(str).str.strip()
+        if args.run_description:
+            desc_list = []
+            for item in args.run_description:
+                desc_list.extend([x.strip() for x in item.split(",") if x.strip()])
+            df = df[df["run_description"].isin(desc_list)].copy()
+        elif not args.include_pedestals:
+            is_ped = df["run_description"].str.lower().str.contains(PED_REGEX, regex=True, na=False)
+            if "pedestal_run" in df.columns:
+                ped_col = pd.to_numeric(df["pedestal_run"], errors="coerce")
+                is_ped |= (df["run_number"] == ped_col)
+            df = df[~is_ped].copy()
 
-    df_filtered = df[mask].copy().sort_values("run_number").reset_index(drop=True)
+    if args.run_min is not None:
+        df = df[df["run_number"] >= args.run_min].copy()
+    if args.run_max is not None:
+        df = df[df["run_number"] <= args.run_max].copy()
 
-    if df_filtered.empty:
-        print(f"[WARNING] Nessun run trovato nel CSV con i criteri specificati.")
+    if df.empty:
+        print("Nessun run corrispondente ai filtri nel CSV.")
         return
 
-    detected_col = detect_time_column(df_filtered, user_col=time_col)
-    print(f"--> Colonna temporale utilizzata: '{detected_col}'")
-    df_filtered["_parsed_time"] = parse_timestamps(df_filtered[detected_col])
+    for col in ("GEM1_V", "DRIFT_V"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    if df_filtered["_parsed_time"].isna().all():
-        raise ValueError(f"Impossibile interpretare i valori della colonna '{detected_col}' come timestamp.")
-
-    t0 = df_filtered["_parsed_time"].min()
-    print(f"--> Tempo t = 0 (primo run): {t0}")
-
-    unit_factors = {
-        "seconds": (1.0, "Tempo dal primo run [s]"),
-        "hours": (3600.0, "Tempo dal primo run [ore]"),
-        "days": (86400.0, "Tempo dal primo run [giorni]"),
-    }
-    scale, xlabel = unit_factors[time_unit]
-
-    if mode == "consecutive":
-        run_ranges = find_consecutive_run_ranges_with_time(df_filtered, split_by_desc=group_by_desc)
+    time_col = detect_time_column(df, args.time_col)
+    if time_col is not None:
+        df["_parsed_time"] = parse_timestamps(df[time_col])
     else:
-        run_ranges = get_per_run_ranges_with_time(df_filtered)
+        df["_parsed_time"] = pd.NaT
+
+    blocks = build_run_blocks(df, mode=args.mode)
+    valid_times = [b["t_start"] for b in blocks if pd.notna(b["t_start"])]
+    t0 = min(valid_times) if valid_times else None
+
+    scale_div = {"seconds": 1.0, "hours": 3600.0, "days": 86400.0}[args.time_unit]
 
     rows = []
-    for r in run_ranges:
-        r_min = r["run_min"]
-        r_max = r["run_max"]
-        vgem = r["vgem"]
-        vdrift = r["vdrift"]
-        desc = r.get("run_description", "")
+    cached_maps = []
 
-        fname = get_map_filename(r_min, r_max, vgem, vdrift, source=source, use_topoveto=use_topoveto)
-        fpath = os.path.join(output_dir, fname)
-
-        if not (os.path.exists(fpath) and os.path.getsize(fpath) > 0):
-            print(f"[WARNING] File ROOT mancante o vuoto, saltato: {fpath}")
+    for blk in blocks:
+        r0, r1 = blk["run_min"], blk["run_max"]
+        root_path = find_root_file_for_block(
+            args.output_dir,
+            args.source,
+            blk,
+            use_topoveto=(args.topo_veto_file is not None),
+        )
+        if root_path is None:
+            print(f"[SKIP] File ROOT non trovato per run {r0}..{r1}")
             continue
 
-        run_label = f"run{r_min}_{r_max}" if r_min != r_max else f"run{r_min}"
-        try:
-            stats = compute_xy_mean_from_root(
-                fpath,
-                source=source,
-                topo_veto_mask=topo_veto_mask,
-                edge_margin=edge_margin,
-                dynamic_spark_veto=dynamic_spark_veto,
-                spark_nsigma=spark_nsigma,
-                spark_skirt_nsigma=spark_skirt_nsigma,
-                spark_max_radius=spark_max_radius,
-                spark_hard_cap=spark_hard_cap,
-                spark_ratio=spark_ratio,
-                spark_abs=spark_abs,
-                spark_dilate=spark_dilate,
-                spark_check_dir=spark_check_dir,
-                run_label=run_label,
-            )
-        except Exception as e:
-            print(f"[ERRORE] Impossibile leggere {fpath}: {e}")
-            continue
+        map_data = load_and_clean_map(
+            root_path=root_path,
+            source=args.source,
+            topo_veto_mask=topo_veto_mask,
+            edge_margin=args.edge_margin,
+            dynamic_spark_veto=not args.no_dynamic_spark_veto,
+            spark_nsigma=args.spark_nsigma,
+            spark_skirt_nsigma=args.spark_skirt_nsigma,
+            spark_max_radius=args.spark_max_radius,
+            spark_hard_cap=args.spark_hard_cap,
+            spark_ratio=args.spark_ratio,
+            spark_abs=args.spark_abs,
+            spark_dilate=args.spark_dilate,
+        )
 
-        dt_start = (r["t_start"] - t0).total_seconds() / scale
-        dt_end = (r["t_end"] - t0).total_seconds() / scale
-        dt_mid = 0.5 * (dt_start + dt_end)
+        if t0 is not None and pd.notna(blk["t_start"]):
+            dt_start = (blk["t_start"] - t0).total_seconds() / scale_div
+            dt_end = (blk["t_end"] - t0).total_seconds() / scale_div
+            dt_mid = 0.5 * (dt_start + dt_end)
+        else:
+            dt_start = float(r0)
+            dt_end = float(r1)
+            dt_mid = 0.5 * (dt_start + dt_end)
 
-        rows.append({
-            "run_min": r_min,
-            "run_max": r_max,
-            "run_description": desc,
-            "VGEM": vgem,
-            "DRIFT_V": vdrift,
-            "t_start_utc": r["t_start"].isoformat() if pd.notnull(r["t_start"]) else "",
-            "t_end_utc": r["t_end"].isoformat() if pd.notnull(r["t_end"]) else "",
-            f"dt_start_{time_unit}": dt_start,
-            f"dt_mid_{time_unit}": dt_mid,
-            f"dt_end_{time_unit}": dt_end,
-            "file": fname,
-            **stats,
-        })
+        row_dict = {
+            "run_min": r0,
+            "run_max": r1,
+            "VGEM": blk["vgem"],
+            "DRIFT_V": blk["vdrift"],
+            "run_description": blk["run_description"],
+            "t_start": dt_start,
+            "t_end": dt_end,
+            "t_mid": dt_mid,
+            "mean_xy": map_data["mean_xy"],
+            "sem_xy": map_data["sem_xy"],
+            "weighted_mean_xy": map_data["weighted_mean_xy"],
+            "integral_xy": map_data["integral_xy"],
+            "active_bins": map_data["active_bins"],
+            "dynamic_veto_bins": map_data["dynamic_veto_bins"],
+            "max_before_clean": map_data["max_before_clean"],
+            "max_after_clean": map_data["max_after_clean"],
+            "file": os.path.basename(root_path),
+        }
+        rows.append(row_dict)
+        cached_maps.append((row_dict, map_data))
 
     if not rows:
-        print("[WARNING] Nessun dato valido disponibile per il summary o il plot.")
+        print("Nessun file ROOT trovato per generare summary e plot.")
         return
 
-    out_df = pd.DataFrame(rows).sort_values(f"dt_start_{time_unit}").reset_index(drop=True)
-    os.makedirs(os.path.dirname(os.path.abspath(summary_csv)), exist_ok=True)
-    out_df.to_csv(summary_csv, index=False)
+    out_df = pd.DataFrame(rows)
+    summary_path = args.summary_csv if os.path.isabs(args.summary_csv) else os.path.join(args.output_dir, args.summary_csv)
+    os.makedirs(os.path.dirname(os.path.abspath(summary_path)), exist_ok=True)
+    out_df.to_csv(summary_path, index=False)
+    print(f"\n[SUMMARY] Salvato CSV riepilogo in: {summary_path}")
 
-    print("\nRiepilogo calcolato:")
-    cols_print = [
-        "run_min", "run_max", "VGEM", "DRIFT_V",
-        f"dt_mid_{time_unit}", "mean_xy", "sem_xy",
-        "dynamic_veto_bins", "max_before_clean", "max_after_clean"
-    ]
-    cols_to_show = [c for c in cols_print if c in out_df.columns]
-    print(out_df[cols_to_show].to_string(index=False))
-    print(f"\n--> Tabella salvata in: {summary_csv}")
+    # Risoluzione z_max uniforme su tutte le mappe 2D
+    if z_max_cfg == "auto":
+        valid_maxes = out_df["max_after_clean"].dropna().values
+        resolved_zmax = float(np.mean(valid_maxes)) if len(valid_maxes) > 0 else None
+        if resolved_zmax is not None:
+            print(
+                f"[2D MAPS] --z-max auto -> Z range uniforme: [{args.z_min:.1f}, {resolved_zmax:.1f}] ADC/pixel "
+                f"(media dei max_after_clean su {len(valid_maxes)} mappe)"
+            )
+    else:
+        resolved_zmax = z_max_cfg
+        if resolved_zmax is not None:
+            print(f"[2D MAPS] --z-max fisso -> Z range uniforme: [{args.z_min:.1f}, {resolved_zmax:.1f}] ADC/pixel")
+        else:
+            print("[2D MAPS] --z-max free -> Z range libero per ciascuna mappa")
 
-    fig, ax = plt.subplots(figsize=(10, 6), dpi=150)
+    # Generazione plot 2D e spark check (PNG + PDF)
+    if args.plot_2dmaps or args.spark_check_dir is not None:
+        for row_dict, map_data in cached_maps:
+            r0, r1 = row_dict["run_min"], row_dict["run_max"]
+            run_tag = f"run_{r0}" if r0 == r1 else f"run_{r0}_{r1}"
 
-    colors = ["black", "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"]
+            if args.plot_2dmaps:
+                out_2d_dir = args.plots_2d_dir if os.path.isabs(args.plots_2d_dir) else os.path.join(args.output_dir, args.plots_2d_dir)
+                out_2d_base = os.path.join(out_2d_dir, f"map2d_{run_tag}")
+                save_2d_map_plot(
+                    map_data=map_data,
+                    title=f"CYGNO 2D Light Map — {run_tag}",
+                    out_base=out_2d_base,
+                    z_min=args.z_min,
+                    z_max=resolved_zmax,
+                )
+
+            if args.spark_check_dir is not None and map_data["dynamic_veto_bins"] > 0:
+                save_spark_check_plot(
+                    map_data=map_data,
+                    run_label=run_tag,
+                    check_dir=args.spark_check_dir,
+                    z_min=args.z_min,
+                    z_max=resolved_zmax,
+                )
+
+        if args.plot_2dmaps:
+            print(f"[2D MAPS] Salvate {len(cached_maps)} mappe 2D (PNG e PDF) in: {args.plots_2d_dir}")
+
+    # Plot history vs tempo (punti neri, scala Y +12%, numeri di run in alto, senza titolo)
+    plot_path = args.plot_output if os.path.isabs(args.plot_output) else os.path.join(args.output_dir, args.plot_output)
+
+    fig, ax = plt.subplots(figsize=(11, 5.8), dpi=150)
+
+    if args.group_by_desc and "run_description" in out_df.columns:
+        groups = list(out_df.groupby("run_description", dropna=False))
+    else:
+        groups = list(out_df.groupby(["VGEM", "DRIFT_V"], dropna=False))
+
+    palette = ["black", "#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#8c564b"]
     markers = ["o", "s", "^", "D", "v", "<"]
 
-    group_cols = ["run_description", "VGEM", "DRIFT_V"] if group_by_desc else ["VGEM", "DRIFT_V"]
-    grouped = out_df.groupby(group_cols, sort=False)
-
-    for idx, (keys, grp) in enumerate(grouped):
-        color = colors[idx % len(colors)]
+    for idx, (key, grp) in enumerate(groups):
+        grp_s = grp.sort_values("t_mid")
+        color = palette[idx % len(palette)]
         marker = markers[idx % len(markers)]
 
-        if group_by_desc:
-            desc, vgem, vdrift = keys
-            label = f"{desc} (VGEM={vgem}V, VD={vdrift}V)"
+        if isinstance(key, tuple):
+            vgem_v, vd_v = key
+            label = f"VGEM={vgem_v:.0f} V, VD={vd_v:.0f} V" if pd.notna(vgem_v) and pd.notna(vd_v) else "All runs"
         else:
-            vgem, vdrift = keys
-            label = f"VGEM={vgem}V, VD={vdrift}V"
+            label = str(key)
 
-        x = grp[f"dt_mid_{time_unit}"].to_numpy()
-        xerr_low = x - grp[f"dt_start_{time_unit}"].to_numpy()
-        xerr_high = grp[f"dt_end_{time_unit}"].to_numpy() - x
-        y_mean = grp["mean_xy"].to_numpy()
-        y_err = grp["sem_xy"].to_numpy()
+        x = grp_s["t_mid"].to_numpy()
+        xerr_low = x - grp_s["t_start"].to_numpy()
+        xerr_high = grp_s["t_end"].to_numpy() - x
+        use_xerr = args.mode == "consecutive" and np.any((xerr_low > 0) | (xerr_high > 0))
 
         ax.errorbar(
             x,
-            y_mean,
-            xerr=[xerr_low, xerr_high] if mode == "consecutive" else None,
-            yerr=y_err,
+            grp_s["mean_xy"].to_numpy(),
+            xerr=[xerr_low, xerr_high] if use_xerr else None,
+            yerr=grp_s["sem_xy"].to_numpy(),
             fmt=f"{marker}-",
             color=color,
+            ecolor=color,
             capsize=3,
-            markersize=6,
+            markersize=5.5,
             linewidth=1.3,
             label=label,
         )
 
+    xlabel = f"Time from first run [{args.time_unit}]" if t0 is not None else "Run number"
     ax.set_xlabel(xlabel, fontsize=11)
-    ax.set_ylabel("Light integral (ADC/pixel)", fontsize=11)
-    ax.grid(True, linestyle="--", alpha=0.45)
-    ax.legend(frameon=True, fontsize=10, loc="best")
+    ax.set_ylabel("Mean Charge / Pixel [ADC]", fontsize=11)
+    ax.grid(True, linestyle="--", alpha=0.4)
+    ax.legend(loc="best", fontsize=9.5, frameon=True)
 
-    # Scala Y leggermente piu' grande (~12% di escursione aggiuntiva rispetto ai limiti automatici)
-    cur_ymin, cur_ymax = ax.get_ylim()
-    cur_span = cur_ymax - cur_ymin
-    if cur_span > 0:
-        ax.set_ylim(cur_ymin - 0.04 * cur_span, cur_ymax + 0.08 * cur_span)
+    # Espansione scala Y (~12% in più)
+    ymin, ymax = ax.get_ylim()
+    yrange = ymax - ymin
+    if yrange > 0:
+        ax.set_ylim(ymin - 0.04 * yrange, ymax + 0.08 * yrange)
 
-    # Secondo asse X superiore con i numeri di run (senza titolo del grafico)
-    xlim = ax.get_xlim()
-    ax.set_xlim(xlim)
-
-    tick_df = (
-        out_df[["run_min", "run_max", f"dt_mid_{time_unit}"]]
-        .drop_duplicates()
-        .sort_values(f"dt_mid_{time_unit}")
-        .reset_index(drop=True)
-    )
-    if len(tick_df) > 30:
-        step = int(np.ceil(len(tick_df) / 25.0))
-        tick_df = tick_df.iloc[::step].reset_index(drop=True)
-
-    tick_positions = tick_df[f"dt_mid_{time_unit}"].to_numpy()
+    # Scala superiore con i numeri di run
+    out_df_sorted = out_df.sort_values("t_mid").reset_index(drop=True)
+    tick_positions = out_df_sorted["t_mid"].to_numpy()
     tick_labels = [
-        str(int(row["run_min"])) if row["run_min"] == row["run_max"] else f"{int(row['run_min'])}-{int(row['run_max'])}"
-        for _, row in tick_df.iterrows()
+        f"{int(r0)}" if int(r0) == int(r1) else f"{int(r0)}-{int(r1)}"
+        for r0, r1 in zip(out_df_sorted["run_min"], out_df_sorted["run_max"])
     ]
+    if len(tick_positions) > 45:
+        step = int(np.ceil(len(tick_positions) / 40.0))
+        tick_labels = [lbl if (i % step == 0) else "" for i, lbl in enumerate(tick_labels)]
 
     ax_top = ax.twiny()
-    ax_top.set_xlim(xlim)
+    ax_top.set_xlim(ax.get_xlim())
     ax_top.set_xticks(tick_positions)
     ax_top.set_xticklabels(tick_labels, fontsize=7.5, rotation=45, ha="left")
-    ax_top.tick_params(axis="x", which="major", pad=2, length=4)
-    ax_top.set_xlabel("Run number", fontsize=10, labelpad=6)
+    ax_top.set_xlabel("Run number", fontsize=10, labelpad=8)
 
     plt.tight_layout()
-    os.makedirs(os.path.dirname(os.path.abspath(plot_output)), exist_ok=True)
-    plt.savefig(plot_output)
+    png_out, pdf_out = save_fig_png_pdf(fig, plot_path)
     plt.close(fig)
-    print(f"--> Plot salvato in: {plot_output}")
+    print(f"[HISTORY PLOT] Salvato grafico temporale in: {png_out} e {pdf_out}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Calcola la media e l'integrale delle mappe CYGNO e genera il plot vs tempo.")
-    parser.add_argument("--csv", type=str, required=True, help="Path del file CSV iniziale")
-    parser.add_argument("--source", type=str, choices=["midas", "reco"], default="midas", help="Sorgente mappe: midas (default) o reco")
-    parser.add_argument("--topo-veto-file", type=str, default=None, help="File .npz della maschera di veto topologico statico")
-    parser.add_argument("--edge-margin", type=float, default=100.0, help="Margine esterno in pixel da escludere su tutti e 4 i lati (default: 100.0, 0 per disabilitare)")
-
-    parser.add_argument("--no-dynamic-spark-veto", action="store_true", help="Disabilita la rimozione dinamica delle spike per singolo run")
-    parser.add_argument("--spark-nsigma", type=float, default=20.0, help="Soglia core in sigma robuste per spike per-run su prof2d (default: 20.0)")
-    parser.add_argument("--spark-skirt-nsigma", type=float, default=12.0, help="Soglia minima di coda in sigma robuste attorno al core (default: 12.0)")
-    parser.add_argument("--spark-max-radius", type=int, default=4, help="Raggio massimo di crescita in bin dal nucleo della spike (default: 4)")
-    parser.add_argument("--spark-hard-cap", type=float, default=150.0, help="Soglia alta fissa di sicurezza in ADC/pixel oltre cui ogni bin viene sempre tagliato (default: 150.0, <=0 per disabilitare)")
-    parser.add_argument("--spark-ratio", type=float, default=None, help="Soglia alternativa come multiplo della mediana del singolo prof2d")
-    parser.add_argument("--spark-abs", type=float, default=None, help="Soglia assoluta alternativa in ADC/pixel sul singolo prof2d")
-    parser.add_argument("--spark-dilate", type=int, default=1, help="Dilatazione finale in bin attorno alle spike per-run (default: 1)")
-    parser.add_argument("--spark-check-dir", type=str, default=None, help="Cartella dove salvare i plot diagnostici dei run con spike rimosse")
-
-    parser.add_argument("--run-description", type=str, nargs="*", default=None, help="Valore/i di run_description da selezionare (default: nessun filtro)")
-    parser.add_argument("--include-pedestals", action="store_true", help="Include anche i run di piedistallo se --run-description non è specificato")
-    parser.add_argument("--group-by-desc", action="store_true", help="Separa le curve del grafico per run_description")
-    parser.add_argument("--run-min", type=int, default=None, help="Numero del run minimo da includere")
-    parser.add_argument("--run-max", type=int, default=None, help="Numero del run massimo da includere")
-    parser.add_argument("--file-s3-tag", type=str, default="LNGS", help="Valore di file_s3_tag da selezionare (default: LNGS)")
-    parser.add_argument("--mode", type=str, choices=["per-run", "consecutive"], default="per-run", help="Modalità di analisi: per-run o consecutive")
-    parser.add_argument("--output-dir", type=str, default=".", help="Cartella contenente i file ROOT delle mappe")
-    parser.add_argument("--summary-csv", type=str, default="xy_mean_summary.csv", help="CSV di output con medie e tempi")
-    parser.add_argument("--plot-output", type=str, default="trend_integral.png", help="File immagine di output per il plot")
-    parser.add_argument("--time-col", type=str, default=None, help="Nome della colonna start-time nel CSV (opzionale, auto-rilevata)")
-    parser.add_argument("--time-unit", type=str, choices=["seconds", "hours", "days"], default="hours", help="Unità asse X (default: hours)")
-
-    args = parser.parse_args()
-
-    run_desc = args.run_description
-    if run_desc is not None and len(run_desc) == 1:
-        if "," in run_desc[0]:
-            run_desc = [d.strip() for d in run_desc[0].split(",")]
-        else:
-            run_desc = run_desc[0]
-
-    analyze_and_plot(
-        csv_file=args.csv,
-        source=args.source,
-        topo_veto_file=args.topo_veto_file,
-        edge_margin=args.edge_margin,
-        dynamic_spark_veto=not args.no_dynamic_spark_veto,
-        spark_nsigma=args.spark_nsigma,
-        spark_skirt_nsigma=args.spark_skirt_nsigma,
-        spark_max_radius=args.spark_max_radius,
-        spark_hard_cap=args.spark_hard_cap,
-        spark_ratio=args.spark_ratio,
-        spark_abs=args.spark_abs,
-        spark_dilate=args.spark_dilate,
-        spark_check_dir=args.spark_check_dir,
-        run_description=run_desc,
-        exclude_pedestals=not args.include_pedestals,
-        group_by_desc=args.group_by_desc,
-        run_min=args.run_min,
-        run_max=args.run_max,
-        file_s3_tag=args.file_s3_tag,
-        mode=args.mode,
-        output_dir=args.output_dir,
-        summary_csv=args.summary_csv,
-        plot_output=args.plot_output,
-        time_col=args.time_col,
-        time_unit=args.time_unit,
-    )
+    main()

@@ -335,6 +335,9 @@ def create_2dmaps_from_midas(
                 occ2d_total += ev_occ_2d
 
             event_count += 1
+            if event_count % 10 == 0:
+                print(f"  > [Run di segnale {run_num:05d}] Processati {event_count} eventi...", flush=True)
+
 
         print(
             f"Run {run_num:05d} completato: {event_count} eventi totali | "

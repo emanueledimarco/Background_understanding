@@ -3,7 +3,7 @@
 Orchestratore principale CYGNO.
 Supporta:
 - Step 1 (--make-topo-veto): mappa bare sul primo run + individuazione scariche GEM
-- Step 2 (--topo-veto-file): generazione mappe 2D pulite su tutti i run (con pulizia spike per singolo evento + su prof2d + taglio bordi)
+- Step 2 (--topo-veto-file): generazione mappe 2D pulite su tutti i run (con pulizia spike per singolo evento + su prof2d + scala colori Z uniforme)
 """
 import sys
 import os
@@ -15,7 +15,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Orchestratore CYGNO: Mappe di luce, Veto Topologico e History vs Tempo.")
     parser.add_argument("--csv", type=str, default="commissioning/runlist_stopped_muons.csv", help="Path del file CSV dei run")
     parser.add_argument("--source", type=str, choices=["midas", "reco"], default="midas", help="Sorgente dati: midas (immagini raw, default) o reco (clusters)")
-    parser.add_argument("--pedrun", type=int, default=None, help="Numero del run di piedistallo per modalità midas")
+    parser.add_argument("--pedrun", type=int, default=None, help="Numero del run di piedistallo per modalità midas (default: auto dal CSV)")
     parser.add_argument("--nsigma", type=float, default=3.0, help="Soglia in nsigma sul piedistallo per modalità midas (default: 3.0)")
     parser.add_argument("--tmpdir", type=str, default="/tmp/", help="Directory temporanea per download MIDAS (default: /tmp/)")
     parser.add_argument("--ped-dir", type=str, default="./pedestals", help="Directory cache piedistalli .npz (default: ./pedestals)")
@@ -50,22 +50,29 @@ if __name__ == "__main__":
     parser.add_argument("--spark-dilate", type=int, default=1, help="Dilatazione in bin attorno alle scariche (default: 1)")
     parser.add_argument("--spark-check-dir", type=str, default=None, help="Directory per i plot di controllo delle spike rimosse dinamicamente")
 
-    parser.add_argument("--run-min", type=int, default=124905, help="Run iniziale (default: 124905)")
-    parser.add_argument("--run-max", type=int, default=124926, help="Run finale (default: 124926)")
+    parser.add_argument("--run-min", type=int, default=None, help="Run iniziale (default: tutti i run dal CSV)")
+    parser.add_argument("--run-max", type=int, default=None, help="Run finale (default: tutti i run dal CSV)")
     parser.add_argument("--run-description", type=str, nargs="*", default=None, help="Filtro opzionale per descrizione/i del run (default: nessun filtro)")
     parser.add_argument("--include-pedestals", action="store_true", help="Include anche i run di piedistallo se --run-description non è specificato")
     parser.add_argument("--group-by-desc", action="store_true", help="Separa le curve del grafico per run_description")
     parser.add_argument("--file-s3-tag", type=str, default="LNGS", help="Tag S3 (default: LNGS)")
     parser.add_argument("--mode", type=str, choices=["per-run", "consecutive"], default="per-run", help="Modalità: per-run (default, 1 run per punto) o consecutive")
     parser.add_argument("--execute", action="store_true", help="Avvia l'elaborazione effettiva (default: False)")
-    parser.add_argument("-j", "--jobs", type=int, default=2, help="Job paralleli di elaborazione run (default: 2)")
+    parser.add_argument("-j", "--jobs", type=int, default=1, help="Job paralleli di elaborazione run (default: 1, consigliato 1 o 2 con MPS)")
     parser.add_argument("-w", "--workers-per-run", type=int, default=4, help="Worker di decompressione ROOT per singolo run in modalità reco (default: 4)")
     parser.add_argument("--overwrite", action="store_true", help="Sovrascrive le mappe esistenti (default: False)")
     parser.add_argument("--output-dir", type=str, default=".", help="Directory di output (default: .)")
     parser.add_argument("--summary-csv", type=str, default="xy_mean_summary.csv", help="CSV di riepilogo con medie e tempi")
     parser.add_argument("--plot-output", type=str, default="trend_integral.png", help="Immagine del grafico temporale")
-    parser.add_argument("--plot-2dmaps", action="store_true", help="Genera anche i plot 2D (PNG/PDF) per ciascun run")
+    parser.add_argument("--plot-2dmaps", action="store_true", help="Genera anche i plot 2D PNG per ciascun run")
     parser.add_argument("--plots-2d-dir", type=str, default="plots_2d", help="Directory di output per le mappe 2D")
+    parser.add_argument("--z-min", type=float, default=0.0, help="Limite inferiore scala colori Z delle mappe 2D (default: 0.0)")
+    parser.add_argument(
+        "--z-max",
+        type=str,
+        default="auto",
+        help="Limite superiore scala colori Z delle mappe 2D: 'auto' (media dei max_after_clean, default), valore numerico (es. 55.0), o 'free'",
+    )
     parser.add_argument("--error-log", type=str, default="pipeline_errors.log", help="File di log errori")
     parser.add_argument("--time-col", type=str, default=None, help="Colonna start-time (auto-rilevata se non specificata)")
     parser.add_argument("--time-unit", type=str, choices=["seconds", "hours", "days"], default="hours", help="Unità asse temporale (default: hours)")
@@ -129,6 +136,8 @@ if __name__ == "__main__":
         plot_output=args.plot_output,
         plot_2dmaps=args.plot_2dmaps,
         plots_2d_dir=args.plots_2d_dir,
+        z_min=args.z_min,
+        z_max=args.z_max,
         error_log=args.error_log,
         time_col=args.time_col,
         time_unit=args.time_unit,
