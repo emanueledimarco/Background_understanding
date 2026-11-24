@@ -18,6 +18,7 @@ from data_reading.read_data_2D import make_cygno_collate_fn
 
 noise_threshold = 1.5
 
+
 # this class is to run with multiple workers in building the dataloader
 class _PicklableCygnoCollate:
     def __init__(self, dataset):
@@ -28,6 +29,7 @@ class _PicklableCygnoCollate:
         if self._fn is None:
             self._fn = make_cygno_collate_fn(self.dataset)
         return self._fn(batch)
+
 
 def build_dataloader(
     inputfile,
@@ -120,19 +122,20 @@ class ConditionEncoder(nn.Module):
 
 
 # ==============================================================================
-# 2. OPERATORE LOCALE EQUIVARIANTE (GUADAGNO + KERNEL PSF RESIDUO)
+# 2. OPERATORE LOCALE EQUIVARIANTE (GUADAGNO + PSF ELLITTICA + GAMMA + GRANA)
 # ==============================================================================
 class LocalDetectorTransportModel(nn.Module):
     """
-    Trasporto locale equivariante alle traslazioni fisicamente vincolato (v2.2):
+    Trasporto locale equivariante alle traslazioni fisicamente vincolato (v2.3):
       1. Guadagno positivo non saturato: g in [0.135, 7.39]
-      2. PSF Gaussiana ellittica unimodale G(sigma_x, sigma_y, theta) + sharpening core
-      3. Granularità stocastica di conteggio proporzionale a sqrt(I) sui pixel attivi
+      2. PSF Gaussiana ellittica unimodale G(sigma_x, sigma_y, theta)
+      3. Esponente di compattezza radiale gamma in [0.65, 1.85]
+      4. Granularità stocastica di conteggio proporzionale a sqrt(I) sui pixel attivi
     """
 
     def __init__(
         self,
-        kernel_size=9,
+        kernel_size=11,
         cond_dim=64,
         sim_dim=3,
         data_dim=4,
@@ -157,14 +160,14 @@ class LocalDetectorTransportModel(nn.Module):
         self.register_buffer("grid_x", gx.view(1, 1, kernel_size, kernel_size))
         self.register_buffer("grid_y", gy.view(1, 1, kernel_size, kernel_size))
 
-        # Inizializzazione vicina all'identità (g=1, sigma~0.42px, sharp=0, grain~0)
+        # Inizializzazione vicina all'identità (g=1, sigma~0.42px, gamma=1, grain~0)
         nn.init.zeros_(self.transport_net[-1].weight)
         nn.init.zeros_(self.transport_net[-1].bias)
 
     @staticmethod
     def _build_transport_net(cond_dim, noise_dim):
         in_dim = 3 * cond_dim + noise_dim
-        # 6 parametri fisici: [log_gain, raw_sx, raw_sy, raw_theta, raw_sharp, raw_grain]
+        # 6 parametri fisici: [log_gain, raw_sx, raw_sy, raw_theta, raw_gamma, raw_grain]
         return nn.Sequential(
             nn.Linear(in_dim, 128),
             nn.SiLU(),
@@ -183,6 +186,20 @@ class LocalDetectorTransportModel(nn.Module):
         unexpected_keys,
         error_msgs,
     ):
+        gx_key = prefix + "grid_x"
+        if gx_key in state_dict:
+            expected_k = state_dict[gx_key].shape[-1]
+            if expected_k != self.kernel_size:
+                self.kernel_size = expected_k
+                self.pad = expected_k // 2
+                device = self.grid_x.device
+                ax = torch.arange(
+                    expected_k, dtype=torch.float32, device=device
+                ) - (expected_k // 2)
+                gy, gx = torch.meshgrid(ax, ax, indexing="ij")
+                self.grid_x = gx.view(1, 1, expected_k, expected_k)
+                self.grid_y = gy.view(1, 1, expected_k, expected_k)
+
         w0_key = prefix + "transport_net.0.weight"
         if w0_key in state_dict:
             in_dim = state_dict[w0_key].shape[1]
@@ -246,9 +263,7 @@ class LocalDetectorTransportModel(nn.Module):
             )
         )
 
-        # 3. Esponente di compattezza gamma in [0.65, 1.85] (at init gamma = 1.0):
-        #    gamma > 1 stringe Width (sigma -> sigma / sqrt(gamma)),
-        #    ortogonale al guadagno perché preserva la somma dell'energia.
+        # 3. Esponente di compattezza gamma in [0.65, 1.85] (at init gamma = 1.0)
         gamma = torch.exp(0.55 * torch.tanh(params[:, 4:5])).view(B, 1, 1, 1)
         eps_pow = 1e-3
         base_offset = torch.pow(
@@ -339,7 +354,8 @@ class LocalDetectorTransportModel(nn.Module):
 
         return out
 
-# Alias unico per flow_cygno_cluster.py (evita che venga istanziato il vecchio modello v1)
+
+# Alias unico per flow_cygno_cluster.py
 CygnoTransportModel = LocalDetectorTransportModel
 
 
@@ -483,9 +499,8 @@ def extract_profiles_with_diagonals(img_tensor):
 # 4. FUNZIONI DI LOSS
 # ==============================================================================
 def compute_mmd_loss(x, y, sigmas=(0.01, 0.05, 0.1, 0.5)):
-    # Usa matmul invece di torch.cdist per compatibilità e velocità su MPS (supporta [N, D] e [B, N, D])
-    x_sq = (x ** 2).sum(dim=-1, keepdim=True)
-    y_sq = (y ** 2).sum(dim=-1, keepdim=True)
+    x_sq = (x**2).sum(dim=-1, keepdim=True)
+    y_sq = (y**2).sum(dim=-1, keepdim=True)
 
     dist_xx = (
         x_sq + x_sq.transpose(-1, -2) - 2.0 * torch.matmul(x, x.transpose(-1, -2))
@@ -499,7 +514,7 @@ def compute_mmd_loss(x, y, sigmas=(0.01, 0.05, 0.1, 0.5)):
 
     mmd = 0.0
     for s in sigmas:
-        gamma = 1.0 / (2.0 * (s ** 2))
+        gamma = 1.0 / (2.0 * (s**2))
         k_xx = torch.exp(-gamma * dist_xx).mean(dim=(-2, -1))
         k_yy = torch.exp(-gamma * dist_yy).mean(dim=(-2, -1))
         k_xy = torch.exp(-gamma * dist_xy).mean(dim=(-2, -1))
@@ -508,13 +523,13 @@ def compute_mmd_loss(x, y, sigmas=(0.01, 0.05, 0.1, 0.5)):
 
 
 def wasserstein_1d_loss(pred_vec, target_vec, mode="l1"):
-    # Indici calcolati su CPU (tensori 32x32) + gather su GPU per evitare hang di torch.sort backward su MPS
     p_idx = torch.argsort(pred_vec.detach().cpu(), dim=-1).to(pred_vec.device)
     t_idx = torch.argsort(target_vec.detach().cpu(), dim=-1).to(target_vec.device)
     p_s = torch.gather(pred_vec, -1, p_idx)
     t_s = torch.gather(target_vec, -1, t_idx)
     loss_fn = F.mse_loss if mode == "mse" else F.l1_loss
     return loss_fn(p_s, t_s)
+
 
 def get_loss_weights(epoch, total_epochs=50):
     return {
@@ -528,6 +543,7 @@ def get_loss_weights(epoch, total_epochs=50):
         "transport": 50.0,
         "identity": 30.0,
     }
+
 
 def compute_cygno_loss(
     pred,
@@ -546,7 +562,6 @@ def compute_cygno_loss(
     data_clamped = F.relu(data_images)
     sim_clamped = F.relu(sim_images) if sim_images is not None else None
 
-    # Maschera differenziabile di zero-suppression coerente con i dati reali
     pred_core = pred_clamped * torch.sigmoid(
         (pred_clamped - noise_threshold) * 5.0
     )
@@ -562,7 +577,6 @@ def compute_cygno_loss(
     )
     data_n = data_core / (data_core.sum(dim=(-1, -2), keepdim=True) + 1e-8)
 
-    # MMD batched su [B, N, D]
     prof_pred = extract_profiles_with_diagonals(pred_n).view(B, N, -1)
     prof_target = extract_profiles_with_diagonals(data_n).view(B, N, -1)
     L_mmd_shape_1d = compute_mmd_loss(
@@ -660,19 +674,24 @@ def compute_cygno_loss(
         + t_id
     )
 
-    # Un'unica sincronizzazione CPU per step invece di 320
-    vals = torch.stack([
-        total_loss.detach(),
-        t_mmd_shape.detach(),
-        t_radial.detach(),
-        t_anchor.detach(),
-        t_centroid.detach(),
-        t_integral.detach(),
-        t_geom.detach(),
-        t_mmd_phys.detach(),
-        t_transp.detach(),
-        t_id.detach(),
-    ]).cpu().tolist()
+    vals = (
+        torch.stack(
+            [
+                total_loss.detach(),
+                t_mmd_shape.detach(),
+                t_radial.detach(),
+                t_anchor.detach(),
+                t_centroid.detach(),
+                t_integral.detach(),
+                t_geom.detach(),
+                t_mmd_phys.detach(),
+                t_transp.detach(),
+                t_id.detach(),
+            ]
+        )
+        .cpu()
+        .tolist()
+    )
 
     keys = [
         "total",
@@ -687,7 +706,6 @@ def compute_cygno_loss(
         "identity",
     ]
     return total_loss, dict(zip(keys, vals))
-
 
 
 # ==============================================================================
@@ -754,6 +772,7 @@ def train_epoch(
 
     return dict(stats)
 
+
 def _extract_state_dict(ckpt):
     if isinstance(ckpt, dict):
         if "model_state_dict" in ckpt:
@@ -771,7 +790,9 @@ def _compute_condition_stats(dataset, loader=None):
             with open(dataset, "rb") as f:
                 payload = pickle.load(f)
             sim_keys = np.asarray(list(payload["sim"].keys()), dtype=np.float32)
-            data_keys = np.asarray(list(payload["data"].keys()), dtype=np.float32)
+            data_keys = np.asarray(
+                list(payload["data"].keys()), dtype=np.float32
+            )
             return (
                 sim_keys.mean(axis=0),
                 np.maximum(sim_keys.std(axis=0), 1e-6),
@@ -810,6 +831,7 @@ def _resolve_device(device):
             return torch.device("cuda")
         return torch.device("cpu")
     return torch.device(device)
+
 
 def _resolve_dataset_and_loader(
     dataset,
@@ -919,7 +941,9 @@ def train_model(
         is_test=False,
     )
 
-    print("=== TRAIN THE MODEL (v2.1 Stochastic Local Equivariant Transport) ===")
+    print(
+        "=== TRAIN THE MODEL (v2.3 Stochastic Local Equivariant Transport) ==="
+    )
     os.makedirs(os.path.dirname(os.path.abspath(outputfile)), exist_ok=True)
 
     model = build_model_from_dataset(dataset, device=device, loader=loader)
@@ -1019,15 +1043,17 @@ def train_model(
 
 def _get_root_rainbow_cmap():
     base = plt.get_cmap("rainbow")
-    colors = np.vstack([
-        np.array([[1.0, 1.0, 1.0, 1.0]]),  # bianco per zero
-        base(np.linspace(0, 1, 255)),
-    ])
+    colors = np.vstack(
+        [
+            np.array([[1.0, 1.0, 1.0, 1.0]]),  # bianco per zero
+            base(np.linspace(0, 1, 255)),
+        ]
+    )
     return mcolors.ListedColormap(colors)
 
 
 # ==============================================================================
-# 6. TEST VISIVO SU 10 CLUSTER RANDOM + VALIDAZIONE
+# 6. TEST VISIVO SU 10 CLUSTER RANDOM + VALIDAZIONE VETTORIZZATA SU GPU
 # ==============================================================================
 def test_training(
     model_or_path,
@@ -1041,7 +1067,6 @@ def test_training(
 
     device = _resolve_device(device)
 
-    # Supporta sia (model, inputfile), sia (model_path, inputfile), sia (inputfile, model_path)
     if isinstance(model_or_path, nn.Module):
         model = model_or_path.to(device)
     else:
@@ -1092,7 +1117,7 @@ def test_training(
     test_cond_sim_labels = []
     test_cond_data_labels = []
 
-    with torch.no_grad():
+    with torch.inference_mode():
         for ibatch, batch in enumerate(loader):
             if ibatch >= 10:
                 break
@@ -1252,6 +1277,7 @@ def plot_training_history(history, output_dir="plots"):
     plt.close()
 
 
+@torch.inference_mode()
 def run_sampled_and_detailed_test(
     model,
     test_loader,
@@ -1262,64 +1288,62 @@ def run_sampled_and_detailed_test(
     save_individual_plots=False,
     output_dir="plots",
 ):
-    model.eval()
+    device = _resolve_device(device)
+    model.to(device).eval()
     os.makedirs(output_dir, exist_ok=True)
 
     pair_dict = defaultdict(list)
 
     print(f"Now accumulating statistics over max {max_batches} batches")
-    with torch.no_grad():
-        for batch_idx, batch in enumerate(test_loader):
-            if max_batches is not None and batch_idx >= max_batches:
-                break
+    for batch_idx, batch in enumerate(test_loader):
+        if max_batches is not None and batch_idx >= max_batches:
+            break
 
-            sim_images = batch["sim_images"].to(device)
-            data_images = batch["data_images"].to(device)
-            B, N, H, W = sim_images.shape
+        sim_images = F.relu(batch["sim_images"]).to(device)
+        data_images = F.relu(batch["data_images"]).to(device)
+        B, N, H, W = sim_images.shape
 
-            sim_images_flat = sim_images.view(B * N, 1, H, W)
-            data_images_flat = data_images.view(B * N, 1, H, W)
+        s_img = sim_images.reshape(B * N, 1, H, W)
+        d_img = data_images.reshape(B * N, 1, H, W)
 
-            sim_cond = batch["sim_cond"].to(device)
-            data_cond = batch["data_cond"].to(device)
+        sim_cond = batch["sim_cond"].to(device)
+        data_cond = batch["data_cond"].to(device)
+        s_c = (
+            sim_cond.reshape(B * N, -1)
+            if sim_cond.ndim == 3
+            else sim_cond.repeat_interleave(N, dim=0)
+        )
+        d_c = (
+            data_cond.reshape(B * N, -1)
+            if data_cond.ndim == 3
+            else data_cond.repeat_interleave(N, dim=0)
+        )
 
-            sim_scalars_raw = compute_physical_scalars_from_image(sim_images_flat)
-            data_scalars_raw = compute_physical_scalars_from_image(data_images_flat)
+        s_scal = compute_physical_scalars_from_image(s_img)
+        d_scal = compute_physical_scalars_from_image(d_img)
 
-            for b in range(B):
-                s_img = sim_images[b].unsqueeze(1)
-                s_c = (
-                    sim_cond[b]
-                    if len(sim_cond.shape) == 3
-                    else sim_cond[b].unsqueeze(0).repeat(N, 1)
-                )
-                d_c = (
-                    data_cond[b]
-                    if len(data_cond.shape) == 3
-                    else data_cond[b].unsqueeze(0).repeat(N, 1)
-                )
+        out = model(s_img, s_c, d_c, s_scal)
+        pred_img_clamped = F.relu(out["pred_images"])
+        pred_scalars_clamped = compute_physical_scalars_from_image(
+            pred_img_clamped
+        )
 
-                s_scal = sim_scalars_raw[b * N : (b + 1) * N]
-                d_scal = data_scalars_raw[b * N : (b + 1) * N]
+        # Unico trasferimento CPU per intero batch (B * N)
+        s_c_np = np.round(s_c.cpu().numpy(), 3)
+        d_c_np = np.round(d_c.cpu().numpy(), 3)
+        s_scal_np = s_scal.cpu().numpy()
+        p_scal_np = pred_scalars_clamped.cpu().numpy()
+        d_scal_np = d_scal.cpu().numpy()
 
-                out = model(s_img, s_c, d_c, s_scal)
-                pred_img_clamped = F.relu(out["pred_images"])
-                pred_scalars_clamped = compute_physical_scalars_from_image(
-                    pred_img_clamped
-                )
-
-                for i in range(N):
-                    key = (
-                        tuple(np.round(s_c[i].cpu().numpy(), 3)),
-                        tuple(np.round(d_c[i].cpu().numpy(), 3)),
-                    )
-                    pair_dict[key].append(
-                        {
-                            "sim_val": s_scal[i].cpu().numpy(),
-                            "pred_val": pred_scalars_clamped[i].cpu().numpy(),
-                            "data_val": d_scal[i].cpu().numpy(),
-                        }
-                    )
+        for idx in range(B * N):
+            key = (tuple(s_c_np[idx]), tuple(d_c_np[idx]))
+            pair_dict[key].append(
+                {
+                    "sim_val": s_scal_np[idx],
+                    "pred_val": p_scal_np[idx],
+                    "data_val": d_scal_np[idx],
+                }
+            )
 
     sorted_keys = sorted(
         pair_dict.keys(), key=lambda k: len(pair_dict[k]), reverse=True
@@ -1357,7 +1381,9 @@ def run_sampled_and_detailed_test(
             d_vals = np.array([e["data_val"][idx_var] for e in events])
 
             all_vals = np.concatenate([s_vals, p_vals, d_vals])
-            vmin, vmax = np.percentile(all_vals, 1.0), np.percentile(all_vals, 99.0)
+            vmin, vmax = np.percentile(all_vals, 1.0), np.percentile(
+                all_vals, 99.0
+            )
             bins = np.linspace(vmin, vmax, 30)
 
             ax.hist(
@@ -1424,7 +1450,9 @@ def run_sampled_and_detailed_test(
                 + f"{d_ctx[3]:.2f}"
             )
 
-            ax.set_title(f"{sim_str}\n{data_str}", fontsize=8.5, pad=8, loc="left")
+            ax.set_title(
+                f"{sim_str}\n{data_str}", fontsize=8.5, pad=8, loc="left"
+            )
             ax.grid(True, linestyle="--", alpha=0.4)
             ax.tick_params(axis="both", which="major", labelsize=8)
             ax.legend(loc="upper right", fontsize=7)
