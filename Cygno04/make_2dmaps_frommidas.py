@@ -9,7 +9,7 @@ from event_spark_filter import clean_single_event_map, save_event_spark_check
 
 
 def get_device(device_pref="auto"):
-    """Rileva e restituisce il device PyTorch (MPS Metal su Apple Silicon, CUDA o CPU)."""
+    """Rileva e restituisce il device MPS (Metal GPU) su Apple Silicon M4."""
     if device_pref == "cpu":
         print("[CPU] Uso CPU forzato da CLI")
         return torch.device("cpu")
@@ -17,13 +17,13 @@ def get_device(device_pref="auto"):
         if torch.backends.mps.is_available():
             print("[GPU] Trovato acceleratore Apple Silicon GPU (MPS Metal)")
             return torch.device("mps")
-        print("[CPU] MPS richiesto ma non disponibile, fallback su CPU")
+        print("[CPU] MPS non disponibile, uso CPU standard")
         return torch.device("cpu")
     if device_pref == "cuda":
         if torch.cuda.is_available():
             print("[GPU] Trovato acceleratore NVIDIA CUDA")
             return torch.device("cuda")
-        print("[CPU] CUDA richiesto ma non disponibile, fallback su CPU")
+        print("[CPU] CUDA non disponibile, uso CPU standard")
         return torch.device("cpu")
 
     if torch.backends.mps.is_available():
@@ -32,12 +32,12 @@ def get_device(device_pref="auto"):
     if torch.cuda.is_available():
         print("[GPU] Trovato acceleratore NVIDIA CUDA")
         return torch.device("cuda")
-    print("[CPU] GPU non disponibile, uso CPU standard")
+    print("[CPU] GPU MPS non disponibile, uso CPU standard")
     return torch.device("cpu")
 
 
 def swift_download_midas_file(run, tmpdir, tag="LNGS"):
-    print(f"--> Download/apertura file MIDAS per il run: {int(run):05d}")
+    print(f"--> Download/apertura file MIDAS per il run: {int(run):05d}", flush=True)
     return cy.open_mid(int(run), path=tmpdir, cloud=True, tag=tag, verbose=False)
 
 
@@ -56,13 +56,13 @@ def get_or_create_pedestal(
     ped_cache_file = os.path.join(ped_dir, f"pedestal_run{pedrun:05d}.npz")
 
     if os.path.exists(ped_cache_file):
-        print(f"\n[PEDESTAL] Caricamento piedistallo da cache: {ped_cache_file}")
+        print(f"\n[PEDESTAL] Caricamento piedistallo da cache: {ped_cache_file}", flush=True)
         data = np.load(ped_cache_file)
-        ped_mean_t = torch.from_numpy(data["ped_mean"]).to(device=device, dtype=torch.float32)
-        ped_std_t = torch.from_numpy(data["ped_std"]).to(device=device, dtype=torch.float32)
+        ped_mean_t = torch.from_numpy(np.ascontiguousarray(data["ped_mean"], dtype=np.float32)).to(device=device)
+        ped_std_t = torch.from_numpy(np.ascontiguousarray(data["ped_std"], dtype=np.float32)).to(device=device)
         return ped_mean_t, ped_std_t
 
-    print(f"\n[PEDESTAL] Calcolo piedistallo dal Run {pedrun:05d} ({device})...")
+    print(f"\n[PEDESTAL] Calcolo piedistallo dal Run {pedrun:05d} (GPU M4)...", flush=True)
     total_height = height_single_cam * num_cameras
 
     sum_img = torch.zeros((total_height, width), dtype=torch.float32, device=device)
@@ -88,7 +88,8 @@ def get_or_create_pedestal(
                     continue
 
                 img_arr, _, _ = cy.daq_cam2array(mevent.banks[key])
-                img_t = torch.from_numpy(img_arr).to(device=device, dtype=torch.float32)
+                img_f32 = np.ascontiguousarray(img_arr, dtype=np.float32)
+                img_t = torch.from_numpy(img_f32).to(device=device)
 
                 y_start = cam_idx * height_single_cam
                 y_end = y_start + height_single_cam
@@ -99,7 +100,7 @@ def get_or_create_pedestal(
 
         event_count += 1
         if event_count % 10 == 0:
-            print(f"  > [Piedistallo] Processati {event_count} eventi...")
+            print(f"  > [Piedistallo] Processati {event_count} eventi...", flush=True)
 
     counts = torch.clamp(counts, min=1)
     ped_mean = sum_img / counts
@@ -186,11 +187,9 @@ def create_2dmaps_from_midas(
         num_cameras=num_cameras,
     )
 
-    # Buffer singolo evento riutilizzati su GPU per evitare riallocazioni per ogni evento
     ev_charge = torch.zeros((total_height, width), dtype=torch.float32, device=device)
     ev_occ = torch.zeros((total_height, width), dtype=torch.float32, device=device)
 
-    # Accumulatori 2D rebinnati (shape: nx_bins=256, ny_bins=432)
     sum2d_total = np.zeros((nx_bins, ny_bins), dtype=np.float64)
     occ2d_total = np.zeros((nx_bins, ny_bins), dtype=np.float64)
     event_spark_veto_map = np.zeros((nx_bins, ny_bins), dtype=np.int32)
@@ -199,7 +198,7 @@ def create_2dmaps_from_midas(
     saved_check_plots = 0
 
     for run_num in range(run_start, run_end + 1):
-        print(f"\n---> Elaborazione Run Segnale: {run_num:05d}")
+        print(f"\n---> Elaborazione Run Segnale: {run_num:05d}", flush=True)
 
         veto_set = set()
         veto_file = os.path.join(veto_events_dir, f"spike_events_run{run_num:05d}.npz")
@@ -227,7 +226,6 @@ def create_2dmaps_from_midas(
             if mevent.header.is_midas_internal_event():
                 continue
 
-            # CONTROLLO VETO RIGOROSO (SUPPORTA SIA SERIAL NUMBER CHE INDICE LOOP)
             event_serial = mevent.header.serial_number
             if (event_serial in veto_set) or (event_count in veto_set):
                 print(f"  [VETO MATCH!] Scartato Evento (Serial: {event_serial}, LoopIdx: {event_count})")
@@ -250,11 +248,12 @@ def create_2dmaps_from_midas(
                         continue
 
                     img_arr, _, _ = cy.daq_cam2array(mevent.banks[key])
+                    img_f32 = np.ascontiguousarray(img_arr, dtype=np.float32)
 
                     y_start = cam_idx * height_single_cam
                     y_end = y_start + height_single_cam
 
-                    img_t = torch.from_numpy(img_arr).to(device=device, dtype=torch.float32)
+                    img_t = torch.from_numpy(img_f32).to(device=device)
 
                     ped_mean_cam = ped_mean[y_start:y_end, :]
                     nsigma_std_cam = nsigma_std[y_start:y_end, :]
@@ -266,11 +265,11 @@ def create_2dmaps_from_midas(
                     ev_occ[y_start:y_end, :] = valid_mask.to(torch.float32)
                     has_cam_data = True
 
-            if has_cam_data:
-                # Rebin 16x16 su GPU -> (nx_bins, ny_bins) su CPU
+            if has_cam_data and bool(ev_occ.any().item()):
                 ev_sum_2d = (
-                    ev_charge.view(ny_bins, bin_y, nx_bins, bin_x)
-                    .sum(dim=(1, 3))
+                    ev_charge.reshape(ny_bins, bin_y, nx_bins, bin_x)
+                    .sum(dim=3)
+                    .sum(dim=1)
                     .transpose(0, 1)
                     .contiguous()
                     .cpu()
@@ -278,8 +277,9 @@ def create_2dmaps_from_midas(
                     .astype(np.float64)
                 )
                 ev_occ_2d = (
-                    ev_occ.view(ny_bins, bin_y, nx_bins, bin_x)
-                    .sum(dim=(1, 3))
+                    ev_occ.reshape(ny_bins, bin_y, nx_bins, bin_x)
+                    .sum(dim=3)
+                    .sum(dim=1)
                     .transpose(0, 1)
                     .contiguous()
                     .cpu()
@@ -358,18 +358,18 @@ def create_2dmaps_from_midas(
 
     ix_indices, iy_indices = np.where(occ2d_total > 0)
     if len(ix_indices) > 0:
-        x_coords = (ix_indices.astype(np.float64) + 0.5) * bin_x
-        y_coords = (iy_indices.astype(np.float64) + 0.5) * bin_y
-        weights_occ = occ2d_total[ix_indices, iy_indices].astype(np.float64)
-        weights_int = sum2d_total[ix_indices, iy_indices].astype(np.float64)
+        x_coords = np.ascontiguousarray((ix_indices.astype(np.float64) + 0.5) * bin_x)
+        y_coords = np.ascontiguousarray((iy_indices.astype(np.float64) + 0.5) * bin_y)
+        weights_occ = np.ascontiguousarray(occ2d_total[ix_indices, iy_indices].astype(np.float64))
+        weights_int = np.ascontiguousarray(sum2d_total[ix_indices, iy_indices].astype(np.float64))
         occ2d.FillN(len(x_coords), x_coords, y_coords, weights_occ)
         int2d.FillN(len(x_coords), x_coords, y_coords, weights_int)
 
     vx_indices, vy_indices = np.where(event_spark_veto_map > 0)
     if len(vx_indices) > 0:
-        vx_coords = (vx_indices.astype(np.float64) + 0.5) * bin_x
-        vy_coords = (vy_indices.astype(np.float64) + 0.5) * bin_y
-        weights_veto = event_spark_veto_map[vx_indices, vy_indices].astype(np.float64)
+        vx_coords = np.ascontiguousarray((vx_indices.astype(np.float64) + 0.5) * bin_x)
+        vy_coords = np.ascontiguousarray((vy_indices.astype(np.float64) + 0.5) * bin_y)
+        weights_veto = np.ascontiguousarray(event_spark_veto_map[vx_indices, vy_indices].astype(np.float64))
         veto2d.FillN(len(vx_coords), vx_coords, vy_coords, weights_veto)
 
     prof2d = int2d.Clone("prof2d_images")

@@ -1,10 +1,9 @@
 import os
+import sys
+import tempfile
+import subprocess
 from collections import deque
 import numpy as np
-
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 
 
 def binary_dilate_2d(mask, radius=1):
@@ -118,9 +117,6 @@ def clean_single_event_map(
     """
     Pulisce la mappa 2D di un singolo evento (ev_sum, ev_occ) prima dell'accumulo
     in int2d_images / occ2d_images.
-
-    Restituisce:
-        ev_sum_clean, ev_occ_clean, veto_mask, full_event_rejected, info_dict
     """
     active = (ev_occ > 0) & np.isfinite(ev_sum)
     if topo_veto_mask is not None:
@@ -154,7 +150,6 @@ def clean_single_event_map(
         core_thr = min(core_thr, float(hard_cap))
         base_skirt_thr = min(base_skirt_thr, core_thr)
 
-    # Fast-path: nessun bin sopra core_thr -> nessuna scarica in questo evento
     if not np.any(active & (ev_prof > core_thr)):
         info = {"core_thr": core_thr, "max_before": max_before, "max_after": max_before, "n_vetoed": 0}
         return ev_sum, ev_occ, np.zeros_like(active, dtype=bool), False, info
@@ -194,18 +189,17 @@ def clean_single_event_map(
     return ev_sum_clean, ev_occ_clean, dyn_mask, False, info
 
 
-def save_event_spark_check(
-    event_label,
-    ev_sum_before,
-    ev_occ_before,
-    veto_mask,
-    x_edges,
-    y_edges,
-    threshold,
-    check_dir,
-):
-    os.makedirs(check_dir, exist_ok=True)
-    out_png = os.path.join(check_dir, f"ev_spark_{event_label}.png")
+def _render_check_from_npz(npz_path, out_png, event_label, threshold):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    data = np.load(npz_path)
+    ev_sum_before = data["ev_sum_before"]
+    ev_occ_before = data["ev_occ_before"]
+    veto_mask = data["veto_mask"].astype(bool)
+    x_edges = data["x_edges"]
+    y_edges = data["y_edges"]
 
     active_before = ev_occ_before > 0
     prof_before = np.full_like(ev_sum_before, np.nan, dtype=np.float64)
@@ -247,3 +241,47 @@ def save_event_spark_check(
     plt.tight_layout()
     plt.savefig(out_png, bbox_inches="tight", pad_inches=0.1)
     plt.close(fig)
+
+
+def save_event_spark_check(
+    event_label,
+    ev_sum_before,
+    ev_occ_before,
+    veto_mask,
+    x_edges,
+    y_edges,
+    threshold,
+    check_dir,
+):
+    """
+    Salva il plot diagnostico in un sottoprocesso isolato così matplotlib non entra
+    mai in conflitto con ROOT/PyTorch nel processo principale.
+    """
+    os.makedirs(check_dir, exist_ok=True)
+    out_png = os.path.join(check_dir, f"ev_spark_{event_label}.png")
+
+    fd, tmp_npz = tempfile.mkstemp(suffix=".npz", prefix="ev_spark_")
+    os.close(fd)
+    try:
+        np.savez_compressed(
+            tmp_npz,
+            ev_sum_before=ev_sum_before,
+            ev_occ_before=ev_occ_before,
+            veto_mask=veto_mask.astype(np.uint8),
+            x_edges=x_edges,
+            y_edges=y_edges,
+        )
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        cmd = [
+            sys.executable,
+            "-c",
+            (
+                f"import sys; sys.path.insert(0, {script_dir!r}); "
+                f"from event_spark_filter import _render_check_from_npz; "
+                f"_render_check_from_npz({tmp_npz!r}, {out_png!r}, {event_label!r}, {float(threshold)!r})"
+            ),
+        ]
+        subprocess.run(cmd, check=False)
+    finally:
+        if os.path.exists(tmp_npz):
+            os.remove(tmp_npz)
