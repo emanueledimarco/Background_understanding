@@ -1,151 +1,206 @@
+#!/usr/bin/env python3
 import os
 import sys
+import glob
+import time
 import argparse
+import threading
 import subprocess
-import multiprocessing
-from datetime import datetime
-from concurrent.futures import ProcessPoolExecutor, as_completed
-
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import numpy as np
 import pandas as pd
 
-
-def get_map_filename(run_min, run_max, vgem, vdrift):
-    return f"cygno04_sideA_muons_withVignetting_VGEM_{vgem}_VD_{vdrift}_run_{run_min}_{run_max}.root"
+PED_REGEX = r"\bped(?:estal|s)?\b"
 
 
-def find_consecutive_run_ranges(df):
-    """
-    Raggruppa run consecutivi che hanno gli stessi valori di GEM1_V, DRIFT_V e run_description.
-    """
-    if df.empty:
-        return []
+def get_map_filename(run_min, run_max, vgem, vdrift, source="midas", use_topoveto=False):
+    veto_tag = "_topoveto" if use_topoveto else ""
+    vgem_str = f"{int(vgem)}" if pd.notna(vgem) and float(vgem).is_integer() else f"{vgem}"
+    vd_str = f"{int(vdrift)}" if pd.notna(vdrift) and float(vdrift).is_integer() else f"{vdrift}"
+    if source == "midas":
+        return f"cygno04_sideA_midas_raw{veto_tag}_VGEM_{vgem_str}_VD_{vd_str}_run_{run_min}_{run_max}.root"
+    return f"cygno04_sideA_muons_withVignetting{veto_tag}_VGEM_{vgem_str}_VD_{vd_str}_run_{run_min}_{run_max}.root"
 
-    df = df.sort_values("run_number").reset_index(drop=True)
 
+def find_existing_root(output_dir, expected_path, r0, r1):
+    if os.path.exists(expected_path) and os.path.getsize(expected_path) > 0:
+        return expected_path
+    matches = sorted(glob.glob(os.path.join(output_dir, f"*_run_{r0}_{r1}.root")))
+    matches = [
+        m for m in matches
+        if "_bare_" not in os.path.basename(m)
+        and not m.endswith("_clean.root")
+        and os.path.getsize(m) > 0
+    ]
+    return matches[0] if matches else None
+
+
+def find_consecutive_run_ranges(df_filtered):
+    df_s = df_filtered.sort_values("run_number").reset_index(drop=True)
     ranges = []
-    current_start = df.loc[0, "run_number"]
-    current_end = df.loc[0, "run_number"]
-    current_vgem = df.loc[0, "GEM1_V"]
-    current_vdrift = df.loc[0, "DRIFT_V"]
-    current_desc = df.loc[0, "run_description"] if "run_description" in df.columns else ""
+    current = None
 
-    for i in range(1, len(df)):
-        row = df.loc[i]
-        run_num = row["run_number"]
-        vgem = row["GEM1_V"]
-        vdrift = row["DRIFT_V"]
-        desc = row["run_description"] if "run_description" in df.columns else ""
+    for _, row in df_s.iterrows():
+        rnum = int(row["run_number"])
+        vgem = row.get("GEM1_V", np.nan)
+        vdrift = row.get("DRIFT_V", np.nan)
+        ped = row.get("_resolved_pedrun", np.nan)
 
-        if (run_num == current_end + 1) and (vgem == current_vgem) and (vdrift == current_vdrift) and (desc == current_desc):
-            current_end = run_num
+        if (
+            current is not None
+            and rnum == current["run_max"] + 1
+            and np.isclose(vgem, current["vgem"], equal_nan=True)
+            and np.isclose(vdrift, current["vdrift"], equal_nan=True)
+            and np.isclose(ped, current["pedrun"], equal_nan=True)
+        ):
+            current["run_max"] = rnum
         else:
-            ranges.append({
-                "run_min": int(current_start),
-                "run_max": int(current_end),
-                "vgem": int(current_vgem) if pd.notnull(current_vgem) else current_vgem,
-                "vdrift": int(current_vdrift) if pd.notnull(current_vdrift) else current_vdrift,
-                "run_description": str(current_desc),
-            })
-            current_start = run_num
-            current_end = run_num
-            current_vgem = vgem
-            current_vdrift = vdrift
-            current_desc = desc
-
-    ranges.append({
-        "run_min": int(current_start),
-        "run_max": int(current_end),
-        "vgem": int(current_vgem) if pd.notnull(current_vgem) else current_vgem,
-        "vdrift": int(current_vdrift) if pd.notnull(current_vdrift) else current_vdrift,
-        "run_description": str(current_desc),
-    })
-
+            if current is not None:
+                ranges.append(current)
+            current = {
+                "run_min": rnum,
+                "run_max": rnum,
+                "vgem": vgem,
+                "vdrift": vdrift,
+                "pedrun": ped,
+            }
+    if current is not None:
+        ranges.append(current)
     return ranges
 
 
-def get_per_run_ranges(df):
-    """
-    Restituisce ogni singolo run come range autonomo [run, run].
-    Consente di monitorare l'evoluzione temporale a grana fine (1 run / 10 o 20 min).
-    """
-    if df.empty:
-        return []
+def resolve_pedruns_from_csv(df_all, df_target, default_pedrun=None):
+    df_target = df_target.copy()
+    if default_pedrun is not None:
+        df_target["_resolved_pedrun"] = int(default_pedrun)
+        return df_target
 
-    df = df.sort_values("run_number").reset_index(drop=True)
-    ranges = []
-    for _, row in df.iterrows():
-        run_num = int(row["run_number"])
-        vgem = int(row["GEM1_V"]) if pd.notnull(row["GEM1_V"]) else row["GEM1_V"]
-        vdrift = int(row["DRIFT_V"]) if pd.notnull(row["DRIFT_V"]) else row["DRIFT_V"]
-        desc = str(row["run_description"]) if "run_description" in df.columns else ""
-        ranges.append({
-            "run_min": run_num,
-            "run_max": run_num,
-            "vgem": vgem,
-            "vdrift": vdrift,
-            "run_description": desc,
-        })
-    return ranges
+    if "pedestal_run" in df_target.columns:
+        ped_col = pd.to_numeric(df_target["pedestal_run"], errors="coerce")
+        if ped_col.notna().all():
+            df_target["_resolved_pedrun"] = ped_col.astype(int)
+            return df_target
 
+    is_ped = df_all["run_description"].astype(str).str.lower().str.contains(PED_REGEX, regex=True, na=False)
+    ped_runs = sorted(df_all.loc[is_ped, "run_number"].dropna().astype(int).unique().tolist())
+    if not ped_runs:
+        raise ValueError("Nessun run di piedistallo trovato nel CSV e --pedrun non specificato.")
 
-def log_error_entry(error_log_path, run_min, run_max, cmd, error_msg, stdout=None, stderr=None):
-    """
-    Scrive un log dettagliato dell'errore su file.
-    """
-    try:
-        os.makedirs(os.path.dirname(os.path.abspath(error_log_path)), exist_ok=True)
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with open(error_log_path, "a", encoding="utf-8") as f_err:
-            f_err.write(f"\n{'='*70}\n")
-            f_err.write(f"[{timestamp}] ERRORE SUL RUN RANGE: {run_min}-{run_max}\n")
-            f_err.write(f"Comando: {' '.join(cmd) if isinstance(cmd, list) else cmd}\n")
-            f_err.write(f"Dettaglio: {error_msg}\n")
-            if stdout:
-                f_err.write(f"--- STDOUT ---\n{stdout}\n")
-            if stderr:
-                f_err.write(f"--- STDERR ---\n{stderr}\n")
-            f_err.write(f"{'='*70}\n")
-    except Exception as e:
-        print(f"[CRITICAL] Impossibile scrivere sull'error log {error_log_path}: {e}")
-
-
-def execute_command(task):
-    """
-    Worker per l'esecuzione del task su singolo core CPU.
-    Cattura l'output e registra gli errori senza bloccare l'intero pool.
-    """
-    run_min, run_max, vgem, vdrift, cmd, error_log_path = task
-    cmd_str = " ".join(cmd)
-    print(f"\n[AVVIO] Range {run_min}-{run_max} (VGEM={vgem}V, VD={vdrift}V)\nComando: {cmd_str}")
-
-    try:
-        proc = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=False,
-        )
-        if proc.returncode == 0:
-            print(f"[COMPLETATO] Range {run_min}-{run_max}")
-            return True, run_min, run_max, None
+    ped_arr = np.array(ped_runs, dtype=int)
+    resolved = []
+    for rnum in df_target["run_number"].astype(int):
+        prev_peds = ped_arr[ped_arr <= rnum]
+        if len(prev_peds) > 0:
+            resolved.append(int(prev_peds[-1]))
         else:
-            err_msg = f"Processo terminato con codice di errore {proc.returncode}"
-            print(f"[ERRORE] Fallito range {run_min}-{run_max}: codice {proc.returncode}")
-            log_error_entry(error_log_path, run_min, run_max, cmd, err_msg, proc.stdout, proc.stderr)
-            return False, run_min, run_max, err_msg
-    except Exception as e:
-        err_msg = str(e)
-        print(f"[ECCEZIONE] Range {run_min}-{run_max}: {err_msg}")
-        log_error_entry(error_log_path, run_min, run_max, cmd, err_msg)
-        return False, run_min, run_max, err_msg
+            resolved.append(int(ped_arr[0]))
+    df_target["_resolved_pedrun"] = resolved
+    return df_target
+
+
+def enforce_cache_limit(tmpdir, max_cache_gb):
+    if max_cache_gb is None or max_cache_gb <= 0:
+        return
+    files = glob.glob(os.path.join(tmpdir, "run*.mid.gz"))
+    if not files:
+        return
+    entries = []
+    total_bytes = 0
+    for f in files:
+        try:
+            st = os.stat(f)
+            entries.append((st.st_mtime, st.st_size, f))
+            total_bytes += st.st_size
+        except OSError:
+            pass
+    limit_bytes = max_cache_gb * (1024**3)
+    entries.sort()
+    for _, sz, fpath in entries:
+        if total_bytes <= limit_bytes:
+            break
+        try:
+            os.remove(fpath)
+            total_bytes -= sz
+        except OSError:
+            pass
+
+
+def run_with_watchdog(cmd, tmpdir, runs_in_job, stall_timeout=90, download_sem=None):
+    if download_sem is not None:
+        download_sem.acquire()
+    try:
+        proc = subprocess.Popen(cmd)
+        last_sizes = {}
+        last_progress = time.time()
+
+        while proc.poll() is None:
+            time.sleep(5)
+            progressed = False
+            for r in runs_in_job:
+                f_mid = os.path.join(tmpdir, f"run{int(r):05d}.mid.gz")
+                if os.path.exists(f_mid):
+                    sz = os.path.getsize(f_mid)
+                    if sz != last_sizes.get(r, -1):
+                        last_sizes[r] = sz
+                        progressed = True
+            if progressed:
+                last_progress = time.time()
+            elif stall_timeout and (time.time() - last_progress) > stall_timeout:
+                proc.kill()
+                proc.wait()
+                for r in runs_in_job:
+                    f_mid = os.path.join(tmpdir, f"run{int(r):05d}.mid.gz")
+                    if os.path.exists(f_mid):
+                        try:
+                            os.remove(f_mid)
+                        except OSError:
+                            pass
+                return -9, f"Timeout stallo download (> {stall_timeout}s)"
+        return proc.returncode, ""
+    finally:
+        if download_sem is not None:
+            download_sem.release()
 
 
 def run_map_processing(
-    csv_file,
+    csv_file="commissioning/runlist_stopped_muons.csv",
+    source="midas",
+    pedrun=None,
+    nsigma=3.0,
+    tmpdir="/tmp/",
+    ped_dir="./pedestals",
+    veto_events_dir="./veto_events",
+    cleanup_midas=False,
+    max_cache_gb=30.0,
+    max_downloads=2,
+    stall_timeout=90,
+    device="auto",
+    make_topo_veto=False,
+    veto_ref_run=None,
+    topo_veto_file=None,
+    veto_plot_output="gem_spark_veto_check.png",
+    topo_spark_nsigma=8.0,
+    edge_margin=100.0,
+    event_spark_veto=True,
+    event_spark_nsigma=25.0,
+    event_spark_skirt_nsigma=15.0,
+    event_spark_max_radius=5,
+    event_spark_hard_cap=400.0,
+    event_spark_dilate=1,
+    dynamic_spark_veto=True,
+    spark_nsigma=20.0,
+    spark_skirt_nsigma=12.0,
+    spark_max_radius=4,
+    spark_hard_cap=150.0,
+    spark_ratio=None,
+    spark_abs=None,
+    spark_dilate=1,
+    spark_check_dir=None,
     run_min=None,
     run_max=None,
     run_description=None,
+    exclude_pedestals=True,
+    group_by_desc=False,
     file_s3_tag="LNGS",
     mode="per-run",
     execute=False,
@@ -157,284 +212,308 @@ def run_map_processing(
     plot_output="trend_integral.png",
     plot_2dmaps=False,
     plots_2d_dir="plots_2d",
+    z_min=0.0,
+    z_max="auto",
     error_log="pipeline_errors.log",
     time_col=None,
     time_unit="hours",
 ):
-    print(f"\n========================================================")
-    print(f"CYGNO MAP & HISTORY ORCHESTRATOR")
-    print(f"========================================================")
-    print(f"--> File CSV di input: {csv_file}")
-    if not os.path.exists(csv_file):
-        raise FileNotFoundError(f"File CSV non trovato: {csv_file}")
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    midas_script = os.path.join(repo_root, "make_2dmaps_frommidas.py")
+    reco_script = os.path.join(repo_root, "make_2dmaps_fromclusters_s3.py")
+    veto_script = os.path.join(repo_root, "find_gem_spark_veto.py")
+    plot_script = os.path.join(repo_root, "plot_xy_mean_vs_time.py")
 
     df = pd.read_csv(csv_file)
-    df["run_description"] = df["run_description"].astype(str).str.strip()
-    df["file_s3_tag"] = df["file_s3_tag"].astype(str).str.strip()
     df["run_number"] = pd.to_numeric(df["run_number"], errors="coerce")
-    df["GEM1_V"] = pd.to_numeric(df["GEM1_V"], errors="coerce")
-    df["DRIFT_V"] = pd.to_numeric(df["DRIFT_V"], errors="coerce")
+    df = df.dropna(subset=["run_number"]).copy()
+    df["run_number"] = df["run_number"].astype(int)
 
-    # Filtro file_s3_tag
-    mask = pd.Series(True, index=df.index)
-    if file_s3_tag:
-        target_tag = file_s3_tag.strip()
-        if run_min is not None or run_max is not None:
-            mask &= (df["file_s3_tag"] == target_tag) | (df["file_s3_tag"].isna()) | (df["file_s3_tag"] == "") | (df["file_s3_tag"] == "nan")
-        else:
-            mask &= (df["file_s3_tag"] == target_tag)
+    if "file_s3_tag" in df.columns and file_s3_tag:
+        df["file_s3_tag"] = df["file_s3_tag"].astype(str).str.strip()
+        df_tag = df[df["file_s3_tag"] == file_s3_tag].copy()
+    else:
+        df_tag = df.copy()
 
-    # Filtro run_min e run_max
+    df_filt = df_tag.copy()
+    if "run_description" in df_filt.columns:
+        df_filt["run_description"] = df_filt["run_description"].astype(str).str.strip()
+        if run_description is not None:
+            desc_list = [run_description] if isinstance(run_description, str) else list(run_description)
+            df_filt = df_filt[df_filt["run_description"].isin(desc_list)].copy()
+        elif exclude_pedestals:
+            is_ped = df_filt["run_description"].str.lower().str.contains(PED_REGEX, regex=True, na=False)
+            if "pedestal_run" in df_filt.columns:
+                ped_col = pd.to_numeric(df_filt["pedestal_run"], errors="coerce")
+                is_ped |= (df_filt["run_number"] == ped_col)
+            df_filt = df_filt[~is_ped].copy()
+
     if run_min is not None:
-        mask &= (df["run_number"] >= run_min)
+        df_filt = df_filt[df_filt["run_number"] >= int(run_min)].copy()
     if run_max is not None:
-        mask &= (df["run_number"] <= run_max)
+        df_filt = df_filt[df_filt["run_number"] <= int(run_max)].copy()
 
-    # Filtro run_description
-    if run_description is not None:
-        if isinstance(run_description, str):
-            if run_description.lower() == "all":
-                pass
-            elif "," in run_description:
-                descs = [d.strip() for d in run_description.split(",") if d.strip()]
-                mask &= df["run_description"].isin(descs)
-            else:
-                mask &= (df["run_description"] == run_description.strip())
-        elif isinstance(run_description, (list, tuple)):
-            descs = [str(d).strip() for d in run_description if str(d).strip()]
-            mask &= df["run_description"].isin(descs)
-
-    df_filtered = df[mask].copy().sort_values("run_number").reset_index(drop=True)
-    print(f"--> Trovati {len(df_filtered)} run corrispondenti ai filtri:")
-    if run_min or run_max:
-        print(f"    Intervallo run: [{run_min} - {run_max}]")
-    if run_description:
-        print(f"    Descrizioni: {run_description}")
-
-    if df_filtered.empty:
-        print("[WARNING] Nessun run trovato con i criteri specificati. Uscita.")
+    if df_filt.empty:
+        print("Nessun run trovato con i filtri specificati.")
         return
 
-    # Determinazione dei range di esecuzione
-    if mode == "consecutive":
-        run_ranges = find_consecutive_run_ranges(df_filtered)
+    for col in ("GEM1_V", "DRIFT_V"):
+        if col in df_filt.columns:
+            df_filt[col] = pd.to_numeric(df_filt[col], errors="coerce")
+
+    if source == "midas":
+        df_filt = resolve_pedruns_from_csv(df_tag, df_filt, default_pedrun=pedrun)
     else:
-        run_ranges = get_per_run_ranges(df_filtered)
+        df_filt["_resolved_pedrun"] = np.nan
 
-    print(f"\n========================================================")
-    print(f"MODALITÀ: {mode.upper()} | {len(run_ranges)} RANGE IDENTIFICATI")
-    print(f"========================================================")
+    # STEP 1: Creazione veto topologico da un run bare di riferimento
+    if make_topo_veto:
+        ref_run = int(veto_ref_run) if veto_ref_run is not None else int(df_filt["run_number"].min())
+        ref_rows = df_filt[df_filt["run_number"] == ref_run]
+        if ref_rows.empty:
+            ref_rows = df_tag[df_tag["run_number"] == ref_run]
+        if ref_rows.empty:
+            raise ValueError(f"Run di riferimento {ref_run} non trovato nel CSV.")
+        ref_row = ref_rows.iloc[0]
+        ref_ped = int(ref_row["_resolved_pedrun"]) if pd.notna(ref_row.get("_resolved_pedrun", np.nan)) else int(pedrun)
+        vgem = ref_row.get("GEM1_V", np.nan)
+        vdrift = ref_row.get("DRIFT_V", np.nan)
+        vgem_str = f"{int(vgem)}" if pd.notna(vgem) and float(vgem).is_integer() else f"{vgem}"
+        vd_str = f"{int(vdrift)}" if pd.notna(vdrift) and float(vdrift).is_integer() else f"{vdrift}"
 
-    os.makedirs(output_dir, exist_ok=True)
-    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    map_script = os.path.join(base_dir, "make_2dmaps_fromclusters_s3.py")
-    plot_script = os.path.join(base_dir, "plot_xy_mean_vs_time.py")
+        bare_root = os.path.join(output_dir, f"cygno04_sideA_midas_raw_bare_VGEM_{vgem_str}_VD_{vd_str}_run_{ref_run}_{ref_run}.root")
+        veto_out_npz = topo_veto_file if topo_veto_file is not None else "gem_spark_veto.npz"
 
-    error_log_path = os.path.abspath(error_log)
+        print(f"\n[STEP 1 — TOPO VETO] Run riferimento: {ref_run} (pedrun={ref_ped})")
+        print(f"  Mappa bare: {bare_root}")
+        print(f"  Veto output: {veto_out_npz}")
 
-    tasks_to_run = []
-    skipped_count = 0
+        if not execute:
+            print("  (Dry-run: aggiungi --execute per eseguire lo Step 1)")
+            return
 
-    for r in run_ranges:
-        r_min = r["run_min"]
-        r_max = r["run_max"]
-        vgem = r["vgem"]
-        vdrift = r["vdrift"]
-        desc = r.get("run_description", "")
+        if overwrite or not os.path.exists(bare_root):
+            cmd_bare = [
+                sys.executable, midas_script,
+                "--run-start", str(ref_run),
+                "--run-end", str(ref_run),
+                "--pedrun", str(ref_ped),
+                "--output", bare_root,
+                "--nsigma", str(nsigma),
+                "--tag", file_s3_tag,
+                "--tmpdir", tmpdir,
+                "--ped-dir", ped_dir,
+                "--veto-events-dir", veto_events_dir,
+                "--no-event-spark-veto",
+                "--device", device,
+            ]
+            subprocess.run(cmd_bare, check=True)
+            if cleanup_midas:
+                f_mid = os.path.join(tmpdir, f"run{ref_run:05d}.mid.gz")
+                if os.path.exists(f_mid):
+                    os.remove(f_mid)
 
-        filename = get_map_filename(r_min, r_max, vgem, vdrift)
-        output_filename = os.path.join(output_dir, filename)
-
-        already_exists = os.path.exists(output_filename) and os.path.getsize(output_filename) > 0
-
-        if already_exists and not overwrite:
-            size_mb = os.path.getsize(output_filename) / (1024 * 1024)
-            print(f"  > [SKIP - GIÀ PRESENTE] Run {r_min:6d} ({size_mb:4.1f} MB) | {desc} -> {filename}")
-            skipped_count += 1
-            continue
-
-        cmd = [
-            sys.executable, map_script,
-            "--run-start", str(r_min),
-            "--run-end", str(r_max),
-            "--output", output_filename,
-            "--workers", str(workers_per_run),
+        cmd_veto = [
+            sys.executable, veto_script,
+            "--input", bare_root,
+            "--source", source,
+            "--veto-output", veto_out_npz,
+            "--plot-output", veto_plot_output,
+            "--nsigma-spark", str(topo_spark_nsigma),
+            "--edge-margin", str(edge_margin),
+            "--dilate", str(spark_dilate),
         ]
-        tasks_to_run.append((r_min, r_max, vgem, vdrift, cmd, error_log_path))
-        print(f"  > [DA GENERARE]         Run {r_min:6d} | {desc} -> {filename}")
+        subprocess.run(cmd_veto, check=True)
+        print(f"\nStep 1 completato. Controlla '{veto_plot_output}' e poi lancia lo Step 2 con:")
+        print(f"  python commissioning/run_orchestrator.py --csv {csv_file} --topo-veto-file {veto_out_npz} --plot-2dmaps --execute -j 2\n")
+        return
 
-    print(f"\nRiepilogo preparazione:")
-    print(f"  - Totale run identificati: {len(run_ranges)}")
-    print(f"  - Già processati (saltati): {skipped_count}")
-    print(f"  - Da processare ora:       {len(tasks_to_run)}")
+    # STEP 2: Generazione mappe 2D per tutti i blocchi / run
+    blocks = [
+        {
+            "run_min": int(r["run_number"]),
+            "run_max": int(r["run_number"]),
+            "vgem": r.get("GEM1_V", np.nan),
+            "vdrift": r.get("DRIFT_V", np.nan),
+            "pedrun": r.get("_resolved_pedrun", np.nan),
+        }
+        for _, r in df_filt.sort_values("run_number").iterrows()
+    ] if mode == "per-run" else find_consecutive_run_ranges(df_filt)
+
+    use_topoveto = topo_veto_file is not None
+    os.makedirs(output_dir, exist_ok=True)
+    tasks = []
+    for blk in blocks:
+        r0, r1 = blk["run_min"], blk["run_max"]
+        vgem, vdrift = blk["vgem"], blk["vdrift"]
+        fname = get_map_filename(r0, r1, vgem, vdrift, source=source, use_topoveto=use_topoveto)
+        out_root = os.path.join(output_dir, fname)
+
+        if source == "midas":
+            cmd = [
+                sys.executable, midas_script,
+                "--run-start", str(r0),
+                "--run-end", str(r1),
+                "--pedrun", str(int(blk["pedrun"])),
+                "--output", out_root,
+                "--nsigma", str(nsigma),
+                "--tag", file_s3_tag,
+                "--tmpdir", tmpdir,
+                "--ped-dir", ped_dir,
+                "--veto-events-dir", veto_events_dir,
+                "--edge-margin", str(edge_margin),
+                "--device", device,
+            ]
+            if topo_veto_file is not None:
+                cmd.extend(["--topo-veto-file", topo_veto_file])
+            if not event_spark_veto:
+                cmd.append("--no-event-spark-veto")
+            else:
+                cmd.extend([
+                    "--event-spark-nsigma", str(event_spark_nsigma),
+                    "--event-spark-skirt-nsigma", str(event_spark_skirt_nsigma),
+                    "--event-spark-max-radius", str(event_spark_max_radius),
+                    "--event-spark-hard-cap", str(event_spark_hard_cap),
+                    "--event-spark-dilate", str(event_spark_dilate),
+                ])
+        else:
+            cmd = [
+                sys.executable, reco_script,
+                "--run-start", str(r0),
+                "--run-end", str(r1),
+                "--output", out_root,
+                "--workers", str(workers_per_run),
+            ]
+
+        existing = None if overwrite else find_existing_root(output_dir, out_root, r0, r1)
+        tasks.append((blk, out_root, cmd, existing))
+
+    to_run = [t for t in tasks if t[3] is None]
+    print(f"\n[ORCHESTRATOR] Trovati {len(tasks)} blocchi/run totali ({len(to_run)} da elaborare, {len(tasks) - len(to_run)} già presenti).")
 
     if not execute:
-        print(f"\n(Modalità DRY-RUN completata. Usa --execute per avviare l'elaborazione)")
+        for blk, out_root, _, _ in to_run[:15]:
+            print(f"  [DRY-RUN] Run {blk['run_min']}..{blk['run_max']} (ped={blk['pedrun']}) -> {os.path.basename(out_root)}")
+        if len(to_run) > 15:
+            print(f"  ... e altri {len(to_run) - 15} run.")
+        print("\nAggiungi --execute per avviare l'elaborazione.")
         return
 
-    failed_tasks = []
-    succeeded_tasks = []
+    # Pre-calcolo piedistalli unici prima del parallelismo (solo se ci sono run da elaborare)
+    if source == "midas" and to_run:
+        unique_peds = sorted({int(t[0]["pedrun"]) for t in to_run if pd.notna(t[0]["pedrun"])})
+        for uped in unique_peds:
+            ped_cache = os.path.join(ped_dir, f"pedestal_run{uped:05d}.npz")
+            if not os.path.exists(ped_cache):
+                print(f"[PRE-PEDESTAL] Generazione cache piedistallo run {uped:05d}...")
+                pre_cmd = [
+                    sys.executable, "-c",
+                    (
+                        f"import sys; sys.path.insert(0, {repo_root!r}); "
+                        f"from make_2dmaps_frommidas import get_device, get_or_create_pedestal; "
+                        f"dev = get_device({device!r}); "
+                        f"get_or_create_pedestal({uped}, dev, tag={file_s3_tag!r}, tmpdir={tmpdir!r}, ped_dir={ped_dir!r})"
+                    ),
+                ]
+                subprocess.run(pre_cmd, check=True)
+                if cleanup_midas:
+                    f_ped_mid = os.path.join(tmpdir, f"run{uped:05d}.mid.gz")
+                    if os.path.exists(f_ped_mid):
+                        os.remove(f_ped_mid)
 
-    # Step 1: Esecuzione delle mappe mancanti
-    if tasks_to_run:
-        max_cores = multiprocessing.cpu_count()
-        actual_jobs = len(tasks_to_run) if n_jobs <= 0 else min(n_jobs, len(tasks_to_run))
-        print(f"\n---> Esecuzione di {len(tasks_to_run)} task con {actual_jobs} processi paralleli...")
+    download_sem = threading.Semaphore(max(1, int(max_downloads)))
+    errors = []
 
-        if actual_jobs == 1:
-            for task in tasks_to_run:
-                success, r_min, r_max, err = execute_command(task)
-                if success:
-                    succeeded_tasks.append((r_min, r_max))
-                else:
-                    failed_tasks.append((r_min, r_max, err))
-        else:
-            with ProcessPoolExecutor(max_workers=actual_jobs) as executor:
-                futures = [executor.submit(execute_command, task) for task in tasks_to_run]
-                for future in as_completed(futures):
-                    success, r_min, r_max, err = future.result()
-                    if success:
-                        succeeded_tasks.append((r_min, r_max))
-                    else:
-                        failed_tasks.append((r_min, r_max, err))
-    else:
-        print("\n---> Tutte le mappe ROOT sono già presenti.")
+    def execute_task(item):
+        blk, out_root, cmd, _ = item
+        runs_in_job = list(range(blk["run_min"], blk["run_max"] + 1))
+        for attempt in range(1, 3):
+            if not cleanup_midas:
+                enforce_cache_limit(tmpdir, max_cache_gb)
+            rc, msg = run_with_watchdog(
+                cmd=cmd,
+                tmpdir=tmpdir,
+                runs_in_job=runs_in_job,
+                stall_timeout=stall_timeout,
+                download_sem=download_sem,
+            )
+            if rc == 0 and os.path.exists(out_root):
+                if cleanup_midas:
+                    for r in runs_in_job:
+                        f_mid = os.path.join(tmpdir, f"run{int(r):05d}.mid.gz")
+                        if os.path.exists(f_mid):
+                            try:
+                                os.remove(f_mid)
+                            except OSError:
+                                pass
+                return True, f"Run {blk['run_min']}..{blk['run_max']} OK"
+            print(f"[RETRY {attempt}/2] Run {blk['run_min']}..{blk['run_max']} fallito (rc={rc} {msg})")
+        return False, f"Run {blk['run_min']}..{blk['run_max']} FALLITO"
 
-    # Step 2: Generazione del riepilogo e del plot temporale (History)
-    print(f"\n========================================================")
-    print(f"STEP 2: AGGIORNAMENTO STORICO & PLOT TEMPORALE")
-    print(f"========================================================")
+    if to_run:
+        with ThreadPoolExecutor(max_workers=max(1, int(n_jobs))) as pool:
+            futures = {pool.submit(execute_task, item): item for item in to_run}
+            for fut in as_completed(futures):
+                ok, status_msg = fut.result()
+                print(f"  -> {status_msg}")
+                if not ok:
+                    errors.append(status_msg)
+
+    if errors:
+        with open(error_log, "w") as flog:
+            for e in errors:
+                flog.write(e + "\n")
+        print(f"[ATTENZIONE] {len(errors)} job falliti. Dettagli in: {error_log}")
+
+    # Lancio finale di plot_xy_mean_vs_time.py
+    effective_check_dir = spark_check_dir
+    if effective_check_dir is None and plot_2dmaps and dynamic_spark_veto:
+        effective_check_dir = os.path.join(plots_2d_dir, "spark_checks")
+
     plot_cmd = [
         sys.executable, plot_script,
         "--csv", csv_file,
+        "--source", source,
+        "--file-s3-tag", file_s3_tag,
         "--mode", mode,
         "--output-dir", output_dir,
         "--summary-csv", summary_csv,
         "--plot-output", plot_output,
+        "--plots-2d-dir", plots_2d_dir,
+        "--z-min", str(z_min),
+        "--z-max", str(z_max),
+        "--edge-margin", str(edge_margin),
+        "--spark-nsigma", str(spark_nsigma),
+        "--spark-skirt-nsigma", str(spark_skirt_nsigma),
+        "--spark-max-radius", str(spark_max_radius),
+        "--spark-hard-cap", str(spark_hard_cap),
+        "--spark-dilate", str(spark_dilate),
         "--time-unit", time_unit,
     ]
-    if file_s3_tag:
-        plot_cmd.extend(["--file-s3-tag", file_s3_tag])
     if run_min is not None:
         plot_cmd.extend(["--run-min", str(run_min)])
     if run_max is not None:
         plot_cmd.extend(["--run-max", str(run_max)])
-    if run_description:
-        if isinstance(run_description, (list, tuple)):
-            plot_cmd.extend(["--run-description"] + [str(d) for d in run_description])
-        else:
-            plot_cmd.extend(["--run-description", str(run_description)])
+    if run_description is not None:
+        desc_list = [run_description] if isinstance(run_description, str) else list(run_description)
+        plot_cmd.extend(["--run-description", *desc_list])
+    if not exclude_pedestals:
+        plot_cmd.append("--include-pedestals")
+    if group_by_desc:
+        plot_cmd.append("--group-by-desc")
+    if topo_veto_file is not None:
+        plot_cmd.extend(["--topo-veto-file", topo_veto_file])
+    if not dynamic_spark_veto:
+        plot_cmd.append("--no-dynamic-spark-veto")
+    if spark_ratio is not None:
+        plot_cmd.extend(["--spark-ratio", str(spark_ratio)])
+    if spark_abs is not None:
+        plot_cmd.extend(["--spark-abs", str(spark_abs)])
+    if plot_2dmaps:
+        plot_cmd.append("--plot-2dmaps")
+    if effective_check_dir is not None:
+        plot_cmd.extend(["--spark-check-dir", effective_check_dir])
     if time_col is not None:
         plot_cmd.extend(["--time-col", time_col])
 
-    print(f"Comando plot: {' '.join(plot_cmd)}")
-    try:
-        subprocess.run(plot_cmd, check=True)
-    except subprocess.CalledProcessError as e:
-        print(f"[ERRORE] Generazione plot fallita: {e}")
-        log_error_entry(error_log_path, run_min or 0, run_max or 0, plot_cmd, str(e))
-
-    # Step 3: Generazione opzionale mappe 2D prof2d (PNG/PDF)
-    if plot_2dmaps:
-        print(f"\n========================================================")
-        print(f"STEP 3: GENERAZIONE MAPPE 2D (PNG/PDF)")
-        print(f"========================================================")
-        os.makedirs(plots_2d_dir, exist_ok=True)
-        plot2d_script = os.path.join(base_dir, "plot_2dmaps.py")
-        for r in run_ranges:
-            r_min = r["run_min"]
-            r_max = r["run_max"]
-            vgem = r["vgem"]
-            vdrift = r["vdrift"]
-            desc = r.get("run_description", "")
-            root_fname = get_map_filename(r_min, r_max, vgem, vdrift)
-            root_fpath = os.path.join(output_dir, root_fname)
-            if not (os.path.exists(root_fpath) and os.path.getsize(root_fpath) > 0):
-                continue
-            title = f"Run {r_min} - {desc} (VGEM={vgem}V, VD={vdrift}V)"
-            out_name = f"run_{r_min}" if r_min == r_max else f"run_{r_min}_{r_max}"
-            p2d_cmd = [
-                sys.executable, plot2d_script,
-                "--from-reco",
-                "--input", root_fpath,
-                "--output-dir", plots_2d_dir,
-                "--output-name", out_name,
-                "--zmin-prof", "0",
-                "--zmax-prof", "8",
-                "--title", title
-            ]
-            try:
-                subprocess.run(p2d_cmd, check=True, stdout=subprocess.DEVNULL)
-                print(f"  > Mappa 2D generata: {plots_2d_dir}/prof2d_{out_name}.png")
-            except Exception as e:
-                print(f"  [ERRORE] Mappa 2D fallita per {out_name}: {e}")
-
-    # Stampa report finale
-    print(f"\n========================================================")
-    print(f"REPORT FINALE PIPELINE")
-    print(f"========================================================")
-    print(f"  - Run totali considerati: {len(run_ranges)}")
-    print(f"  - Run già esistenti:      {skipped_count}")
-    print(f"  - Run generati con successo: {len(succeeded_tasks)}")
-    print(f"  - Run falliti:            {len(failed_tasks)}")
-    if failed_tasks:
-        print(f"\n  [ATTENZIONE] I seguenti run hanno generato errori:")
-        for r_min, r_max, err in failed_tasks:
-            print(f"    * Run {r_min}-{r_max}: {err}")
-        print(f"  --> Log completo degli errori salvato in: {error_log_path}")
-    print(f"  --> File summary CSV: {os.path.abspath(summary_csv)}")
-    print(f"  --> Grafico history:  {os.path.abspath(plot_output)}")
-    print(f"========================================================\n")
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Orchestratore CYGNO: mappe di luce medie, integrale e history vs tempo.")
-    parser.add_argument("--csv", type=str, default="commissioning/runlist_stopped_muons.csv", help="Path del file CSV dei run (default: commissioning/runlist_stopped_muons.csv)")
-    parser.add_argument("--run-min", type=int, default=124905, help="Run minimo da processare (default: 124905)")
-    parser.add_argument("--run-max", type=int, default=124926, help="Run massimo da processare (default: 124926)")
-    parser.add_argument("--run-description", type=str, nargs="*", default=None, help="Descrizione/i dei run da filtrare (default: tutte)")
-    parser.add_argument("--file-s3-tag", type=str, default="LNGS", help="Tag S3 da selezionare (default: LNGS)")
-    parser.add_argument("--mode", type=str, choices=["per-run", "consecutive"], default="per-run", help="Modalità: 'per-run' per evoluzione temporale (default) o 'consecutive' per fondere run adiacenti")
-    parser.add_argument("--execute", action="store_true", help="Esegue effettivamente l'elaborazione (se omesso: dry-run)")
-    parser.add_argument("-j", "--jobs", type=int, default=1, help="Numero di job paralleli (default: 1)")
-    parser.add_argument("-w", "--workers-per-run", type=int, default=4, help="Numero di worker decompressione ROOT per singolo run (default: 4)")
-    parser.add_argument("--overwrite", action="store_true", help="Rigenera i file ROOT anche se esistono già")
-    parser.add_argument("--output-dir", type=str, default=".", help="Directory di output per i file ROOT delle mappe (default: .)")
-    parser.add_argument("--summary-csv", type=str, default="xy_mean_summary.csv", help="CSV di riepilogo con medie e tempi")
-    parser.add_argument("--plot-output", type=str, default="trend_integral.png", help="Nome file immagine del grafico")
-    parser.add_argument("--plot-2dmaps", action="store_true", help="Genera anche i plot 2D (PNG/PDF) di prof2d per ciascun run")
-    parser.add_argument("--plots-2d-dir", type=str, default="plots_2d", help="Directory per i plot 2D (default: plots_2d)")
-    parser.add_argument("--error-log", type=str, default="pipeline_errors.log", help="Path del file di log per gli errori (default: pipeline_errors.log)")
-    parser.add_argument("--time-col", type=str, default=None, help="Nome colonna timestamp (opzionale)")
-    parser.add_argument("--time-unit", type=str, choices=["seconds", "hours", "days"], default="hours", help="Unità asse X (default: hours)")
-
-    args = parser.parse_args()
-
-    # Gestione run_description (stringa singola, virgole o lista)
-    run_desc = args.run_description
-    if run_desc is not None and len(run_desc) == 1:
-        if "," in run_desc[0]:
-            run_desc = [d.strip() for d in run_desc[0].split(",")]
-        else:
-            run_desc = run_desc[0]
-
-    run_map_processing(
-        csv_file=args.csv,
-        run_min=args.run_min,
-        run_max=args.run_max,
-        run_description=run_desc,
-        file_s3_tag=args.file_s3_tag,
-        mode=args.mode,
-        execute=args.execute,
-        n_jobs=args.jobs,
-        workers_per_run=args.workers_per_run,
-        overwrite=args.overwrite,
-        output_dir=args.output_dir,
-        summary_csv=args.summary_csv,
-        plot_output=args.plot_output,
-        plot_2dmaps=args.plot_2dmaps,
-        plots_2d_dir=args.plots_2d_dir,
-        error_log=args.error_log,
-        time_col=args.time_col,
-        time_unit=args.time_unit,
-    )
+    subprocess.run(plot_cmd, check=True)

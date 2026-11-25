@@ -57,7 +57,7 @@ def build_dataloader(
 
 
 # ==============================================================================
-# 1. ENCODER DELLE CONDIZIONI CON NORMALIZZAZIONE INTEGRATA NEL CHECKPOINT
+# 1. ENCODER DELLE CONDIZIONI CON z CONDIVISO 1:1 TRA SIM E DATA
 # ==============================================================================
 class ConditionEncoder(nn.Module):
 
@@ -72,12 +72,21 @@ class ConditionEncoder(nn.Module):
         self.register_buffer("data_mean", torch.zeros(1, data_dim))
         self.register_buffer("data_std", torch.ones(1, data_dim))
 
+        # z è identica 1:1 tra SIM e DATA: viene codificata una sola volta come regime fisico condiviso
+        self.z_net = nn.Sequential(
+            nn.Linear(1, 32),
+            nn.SiLU(),
+            nn.Linear(32, 32),
+            nn.LayerNorm(32),
+        )
+        # (z, alpha, lambda): parametri fisici della simulazione (saturazione e assorbimento)
         self.sim_net = nn.Sequential(
             nn.Linear(sim_dim, 64),
             nn.SiLU(),
             nn.Linear(64, emb_dim),
             nn.LayerNorm(emb_dim),
         )
+        # (z, P, T, H): condizioni ambientali del rivelatore reale
         self.data_net = nn.Sequential(
             nn.Linear(data_dim, 64),
             nn.SiLU(),
@@ -109,6 +118,10 @@ class ConditionEncoder(nn.Module):
             .clamp(min=1e-6)
         )
 
+    def encode_z(self, sim_cond):
+        z_norm = (sim_cond[:, :1] - self.sim_mean[:, :1]) / self.sim_std[:, :1]
+        return self.z_net(z_norm)
+
     def encode_sim(self, sim_cond):
         sim_norm = (sim_cond - self.sim_mean) / self.sim_std
         return self.sim_net(sim_norm)
@@ -118,20 +131,26 @@ class ConditionEncoder(nn.Module):
         return self.data_net(data_norm)
 
     def forward(self, sim_cond, data_cond):
-        return self.encode_sim(sim_cond), self.encode_data(data_cond)
+        return (
+            self.encode_z(sim_cond),
+            self.encode_sim(sim_cond),
+            self.encode_data(data_cond),
+        )
 
 
 # ==============================================================================
-# 2. OPERATORE LOCALE EQUIVARIANTE (MEDIA DETERMINISTICA + DISPERSIONE FISICA)
+# 2. OPERATORE FISICO LOCALE EQUIVARIANTE (v3.0: SATURAZIONE GEM + PSF ISOTROPA)
 # ==============================================================================
 class LocalDetectorTransportModel(nn.Module):
     """
-    Trasporto locale equivariante alle traslazioni fisicamente vincolato (v2.4):
-      1. mean_net predice lo shift deterministico (log_gain, PSF, gamma) dato (sim_cond, data_cond)
-      2. std_net predice la dispersione fisica evento-per-evento (senza esplosioni di varianza)
-      3. PSF Gaussiana ellittica con pavimento quasi nullo (0.05 px) + gamma in [0.43, 2.34]
-         per consentire sia allargamento sia restringimento (coda sinistra di Width)
-      4. Granularità di conteggio limitata (<= 0.12 * sqrt(I)) per evitare buchi artificiali
+    Trasporto locale fisicamente vincolato (v3.0):
+      1. z condiviso 1:1 tra SIM (z, alpha, lambda) e DATA (z, P, T, H)
+      2. PSF quasi-isotropa senza rumore casuale sulla forma (preserva Eccentricity)
+      3. Esponente di compattezza radiale gamma in [0.43, 2.34] (coda sinistra di Width)
+      4. Saturazione differenziale di carica spaziale GEM (Eq. 11 Amaro et al., EPJC 2026):
+            I_out(x,y) = g * I_shaped(x,y) / (1 + s_sat * I_shaped(x,y) / I_ref)
+         che agisce localmente sui pixel ad alta densità (piccole z) e si annulla
+         automaticamente quando la nube è diffusa (grandi z), evitando smearing spuri.
     """
 
     def __init__(
@@ -140,46 +159,50 @@ class LocalDetectorTransportModel(nn.Module):
         cond_dim=64,
         sim_dim=3,
         data_dim=4,
-        noise_dim=8,
+        noise_dim=2,
     ):
         super().__init__()
         assert kernel_size % 2 == 1, "kernel_size deve essere dispari"
         self.kernel_size = kernel_size
         self.pad = kernel_size // 2
         self.cond_dim = cond_dim
-        self.noise_dim = max(noise_dim, 5)
+        self.noise_dim = max(noise_dim, 2)
 
         self.cond_encoder = ConditionEncoder(
             sim_dim=sim_dim, data_dim=data_dim, emb_dim=cond_dim
         )
 
-        # Shift medio deterministico: [mu_log_gain, mu_raw_sx, mu_raw_sy, mu_raw_theta, mu_raw_gamma]
+        in_dim = 32 + 2 * cond_dim  # [h_z, h_sim, h_data]
+
+        # 6 parametri fisici deterministici:
+        # [mu_log_gain, raw_sigma, raw_ellip, raw_theta, raw_gamma, raw_sat]
         self.mean_net = nn.Sequential(
-            nn.Linear(3 * cond_dim, 128),
+            nn.Linear(in_dim, 128),
             nn.SiLU(),
             nn.Linear(128, 128),
             nn.SiLU(),
-            nn.Linear(128, 5),
+            nn.Linear(128, 6),
         )
 
-        # Dispersione condizionale evento-per-evento: [std_log_gain, std_raw_psf, std_raw_gamma, raw_grain]
+        # Solo piccolo jitter fisico sul guadagno (<= 0.04) e granularità sensore (<= 0.08)
+        # NESSUN rumore casuale su PSF o saturazione -> niente smearing spurio
         self.std_net = nn.Sequential(
-            nn.Linear(3 * cond_dim, 64),
+            nn.Linear(in_dim, 64),
             nn.SiLU(),
-            nn.Linear(64, 4),
+            nn.Linear(64, 2),
         )
 
-        # Griglia locale centrata per la PSF Gaussiana ellittica
+        # Griglia locale centrata per la PSF Gaussiana
         ax = torch.arange(kernel_size, dtype=torch.float32) - (kernel_size // 2)
         gy, gx = torch.meshgrid(ax, ax, indexing="ij")
         self.register_buffer("grid_x", gx.view(1, 1, kernel_size, kernel_size))
         self.register_buffer("grid_y", gy.view(1, 1, kernel_size, kernel_size))
 
-        # Inizializzazione vicina all'identità (g=1, sigma~0.09px, gamma=1, piccola dispersione)
+        # Inizializzazione all'identità (g=1, sigma~0.09px, gamma=1, s_sat=0)
         nn.init.zeros_(self.mean_net[-1].weight)
         nn.init.zeros_(self.mean_net[-1].bias)
         nn.init.zeros_(self.std_net[-1].weight)
-        nn.init.constant_(self.std_net[-1].bias, -2.5)
+        nn.init.constant_(self.std_net[-1].bias, -3.0)
 
     def _load_from_state_dict(
         self,
@@ -191,10 +214,13 @@ class LocalDetectorTransportModel(nn.Module):
         unexpected_keys,
         error_msgs,
     ):
-        if prefix + "transport_net.0.weight" in state_dict:
+        if (
+            prefix + "transport_net.0.weight" in state_dict
+            or prefix + "cond_encoder.z_net.0.weight" not in state_dict
+        ):
             raise RuntimeError(
-                "Il checkpoint salvato appartiene alla vecchia architettura (v2.3). "
-                "Rilancia il training con '--train' per generare il nuovo modello v2.4."
+                "Il checkpoint salvato appartiene a una versione precedente del modello. "
+                "Rilancia il training con '--train' per generare il nuovo modello v3.0."
             )
 
         gx_key = prefix + "grid_x"
@@ -221,10 +247,15 @@ class LocalDetectorTransportModel(nn.Module):
             error_msgs,
         )
 
-    def _build_elliptical_psf(self, raw_sx, raw_sy, raw_theta):
-        # Pavimento quasi nullo (0.05 px -> delta di Dirac al init ~0.09 px) fino a 2.25 px
-        sx = (0.05 + 2.20 * torch.sigmoid(raw_sx - 4.0)).view(-1, 1, 1, 1)
-        sy = (0.05 + 2.20 * torch.sigmoid(raw_sy - 4.0)).view(-1, 1, 1, 1)
+    def _build_quasi_isotropic_psf(self, raw_sigma, raw_ellip, raw_theta):
+        # Larghezza radiale di base in [0.05, 2.25] px (al init ~0.09 px -> delta di Dirac)
+        sigma_0 = (0.05 + 2.20 * torch.sigmoid(raw_sigma - 4.0)).view(
+            -1, 1, 1, 1
+        )
+        # Anisotropia strettamente limitata a +-10% per non distorcere Eccentricity
+        ellip = (0.10 * torch.tanh(raw_ellip)).view(-1, 1, 1, 1)
+        sx = sigma_0 * torch.exp(ellip)
+        sy = sigma_0 * torch.exp(-ellip)
         theta = (0.5 * math.pi * torch.tanh(raw_theta)).view(-1, 1, 1, 1)
 
         cos_t = torch.cos(theta)
@@ -236,30 +267,24 @@ class LocalDetectorTransportModel(nn.Module):
         kernel = kernel / (kernel.sum(dim=(-2, -1), keepdim=True) + 1e-8)
         return kernel
 
-    def _apply_transport(self, img, h_sim, h_data, noise, add_grain=True):
+    def _apply_transport(self, img, h_z, h_sim, h_data, noise, add_grain=True):
         B = img.shape[0]
-        h_diff = h_data - h_sim
-        cond_feat = torch.cat([h_sim, h_data, h_diff], dim=-1)
+        cond_feat = torch.cat([h_z, h_sim, h_data], dim=-1)
 
         mu_params = self.mean_net(cond_feat)
         std_params = self.std_net(cond_feat)
 
-        # Dispersioni fisiche limitate per evitare allargamenti spuri
-        std_log_gain = 0.25 * torch.sigmoid(std_params[:, 0:1])
-        std_raw_psf = 0.60 * torch.sigmoid(std_params[:, 1:2])
-        std_raw_gamma = 0.45 * torch.sigmoid(std_params[:, 2:3])
-
+        # Jitter di guadagno strettamente fisico (<= 0.04 in log_gain) -> zero smearing artificiale
+        std_log_gain = 0.04 * torch.sigmoid(std_params[:, 0:1])
         log_gain = mu_params[:, 0:1] + std_log_gain * noise[:, 0:1]
-        raw_sx = mu_params[:, 1:2] + std_raw_psf * noise[:, 1:2]
-        raw_sy = mu_params[:, 2:3] + std_raw_psf * noise[:, 2:3]
-        raw_theta = mu_params[:, 3:4] + std_raw_psf * noise[:, 3:4]
-        raw_gamma = mu_params[:, 4:5] + std_raw_gamma * noise[:, 4:5]
 
-        # 1. Guadagno positivo ampio: [0.135, 7.39]
+        # 1. Guadagno lineare non saturato: [0.135, 7.39]
         gain = torch.exp(2.0 * torch.tanh(0.5 * log_gain))
 
-        # 2. Convoluzione con PSF Gaussiana ellittica tramite unfold + bmm
-        psf_kernel = self._build_elliptical_psf(raw_sx, raw_sy, raw_theta)
+        # 2. Convoluzione con PSF quasi-isotropa
+        psf_kernel = self._build_quasi_isotropic_psf(
+            mu_params[:, 1:2], mu_params[:, 2:3], mu_params[:, 3:4]
+        )
         img_padded = F.pad(
             img, (self.pad, self.pad, self.pad, self.pad), mode="replicate"
         )
@@ -270,9 +295,10 @@ class LocalDetectorTransportModel(nn.Module):
             )
         )
 
-        # 3. Esponente di compattezza radiale gamma in [0.43, 2.34] (at init gamma = 1.0):
-        #    permette di stringere Width (coda sinistra) preservando il flusso totale.
-        gamma = torch.exp(0.85 * torch.tanh(raw_gamma)).view(B, 1, 1, 1)
+        # 3. Esponente di compattezza radiale gamma in [0.43, 2.34] (at init gamma = 1.0)
+        gamma = torch.exp(0.85 * torch.tanh(mu_params[:, 4:5])).view(
+            B, 1, 1, 1
+        )
         eps_pow = 1e-3
         base_offset = torch.pow(
             torch.tensor(eps_pow, device=img.device, dtype=img.dtype), gamma
@@ -282,30 +308,38 @@ class LocalDetectorTransportModel(nn.Module):
         flux_gamma = img_gamma.sum(dim=(-1, -2), keepdim=True) + 1e-8
         img_shaped = img_gamma * (flux_psf / flux_gamma)
 
-        scaled = gain.view(B, 1, 1, 1) * img_shaped
+        # 4. Saturazione differenziale di carica spaziale GEM (Eq. 11 Amaro et al., EPJC 2026):
+        #    G(n0) = G_tilde / (1 + beta * n0 * (G_tilde - 1))
+        #    s_sat > 0: Data satura più della SIM (comprime i picchi densi a piccole z)
+        #    s_sat < 0: Data satura meno della SIM (de-saturazione)
+        sat_alpha = (0.60 * torch.tanh(mu_params[:, 5:6])).view(B, 1, 1, 1)
+        charge_density = img_shaped / 100.0
+        sat_denom = torch.clamp(1.0 + sat_alpha * charge_density, min=0.35)
+        saturated = (gain.view(B, 1, 1, 1) * img_shaped) / sat_denom
 
-        # 4. Granularità statistica contenuta (<= 0.12 * sqrt(I)) solo sul core attivo
+        # 5. Granularità statistica contenuta (<= 0.08 * sqrt(I)) solo sul core attivo
         if add_grain:
-            grain_scale = (0.12 * torch.sigmoid(std_params[:, 3:4])).view(
+            grain_scale = (0.08 * torch.sigmoid(std_params[:, 1:2])).view(
                 B, 1, 1, 1
             )
-            active_mask = (scaled > 0.5).to(scaled.dtype)
-            pixel_noise = torch.randn_like(scaled)
+            active_mask = (saturated > 0.5).to(saturated.dtype)
+            pixel_noise = torch.randn_like(saturated)
             pred = F.relu(
-                scaled
+                saturated
                 + active_mask
                 * grain_scale
-                * torch.sqrt(scaled + 1e-4)
+                * torch.sqrt(saturated + 1e-4)
                 * pixel_noise
             )
         else:
-            pred = scaled
+            pred = saturated
 
         delta_h = pred - img
-        return pred, delta_h, gain, gamma.view(B, 1), psf_kernel
+        return pred, delta_h, gain, gamma.view(B, 1), sat_alpha.view(B, 1), psf_kernel
 
     def forward_identity(self, sim_images, sim_cond):
         B = sim_images.shape[0]
+        h_z = self.cond_encoder.encode_z(sim_cond)
         h_sim = self.cond_encoder.encode_sim(sim_cond)
         zero_noise = torch.zeros(
             B,
@@ -313,14 +347,17 @@ class LocalDetectorTransportModel(nn.Module):
             device=sim_images.device,
             dtype=sim_images.dtype,
         )
-        pred_id, delta_h, gain, gamma, psf_kernel = self._apply_transport(
-            sim_images, h_sim, h_sim, zero_noise, add_grain=False
+        pred_id, delta_h, gain, gamma, sat_alpha, psf_kernel = (
+            self._apply_transport(
+                sim_images, h_z, h_sim, h_sim, zero_noise, add_grain=False
+            )
         )
         return {
             "pred_images": pred_id,
             "delta_h": delta_h,
             "gain": gain,
             "gamma": gamma,
+            "sat_alpha": sat_alpha,
             "kernel_res": psf_kernel,
         }
 
@@ -342,11 +379,19 @@ class LocalDetectorTransportModel(nn.Module):
                 dtype=sim_images.dtype,
             )
 
-        h_sim = self.cond_encoder.encode_sim(sim_cond)
-        h_data = self.cond_encoder.encode_data(data_cond)
+        # z è forzata 1:1 da sim_cond a data_cond (stessa distanza dalle GEM)
+        data_cond_matched = torch.cat(
+            [sim_cond[:, :1], data_cond[:, 1:]], dim=-1
+        )
 
-        pred, delta_h, gain, gamma, psf_kernel = self._apply_transport(
-            sim_images, h_sim, h_data, noise, add_grain=True
+        h_z = self.cond_encoder.encode_z(sim_cond)
+        h_sim = self.cond_encoder.encode_sim(sim_cond)
+        h_data = self.cond_encoder.encode_data(data_cond_matched)
+
+        pred, delta_h, gain, gamma, sat_alpha, psf_kernel = (
+            self._apply_transport(
+                sim_images, h_z, h_sim, h_data, noise, add_grain=True
+            )
         )
 
         out = {
@@ -354,13 +399,14 @@ class LocalDetectorTransportModel(nn.Module):
             "delta_h": delta_h,
             "gain": gain,
             "gamma": gamma,
+            "sat_alpha": sat_alpha,
             "kernel_res": psf_kernel,
         }
 
         if compute_identity:
             zero_noise = torch.zeros_like(noise)
-            pred_id, _, _, _, _ = self._apply_transport(
-                sim_images, h_sim, h_sim, zero_noise, add_grain=False
+            pred_id, _, _, _, _, _ = self._apply_transport(
+                sim_images, h_z, h_sim, h_sim, zero_noise, add_grain=False
             )
             out["pred_identity"] = pred_id
 
@@ -542,11 +588,11 @@ def wasserstein_1d_loss(pred_vec, target_vec, mode="l1"):
     loss_fn = F.mse_loss if mode == "mse" else F.l1_loss
     return loss_fn(p_s, t_s)
 
+
 def dist_match_loss(pred_vec, target_vec, mode="l1", robust_outliers=False):
     """
-    Combina Wasserstein 1D + allineamento dei momenti del core.
-    Per variabili con code lunghe da pile-up/cosmici (Length, Width) usa
-    SmoothL1 + mediana/IQR così 1 doppio cluster su 32 non domina il gradiente.
+    Combina Wasserstein 1D + allineamento della posizione centrale (mediana).
+    Non forza la varianza globale su bin bimodali così i picchi stretti restano stretti.
     """
     w_loss = wasserstein_1d_loss(pred_vec, target_vec, mode=mode)
     if robust_outliers:
@@ -555,30 +601,35 @@ def dist_match_loss(pred_vec, target_vec, mode="l1", robust_outliers=False):
             target_vec.median(dim=1).values,
             beta=0.25,
         )
-        p_q75, p_q25 = torch.quantile(pred_vec, 0.75, dim=1), torch.quantile(pred_vec, 0.25, dim=1)
-        t_q75, t_q25 = torch.quantile(target_vec, 0.75, dim=1), torch.quantile(target_vec, 0.25, dim=1)
+        p_q75, p_q25 = (
+            torch.quantile(pred_vec, 0.75, dim=1),
+            torch.quantile(pred_vec, 0.25, dim=1),
+        )
+        t_q75, t_q25 = (
+            torch.quantile(target_vec, 0.75, dim=1),
+            torch.quantile(target_vec, 0.25, dim=1),
+        )
         iqr_loss = F.smooth_l1_loss(p_q75 - p_q25, t_q75 - t_q25, beta=0.25)
         return w_loss + med_loss + 0.5 * iqr_loss
     else:
-        mean_loss = F.mse_loss(pred_vec.mean(dim=1), target_vec.mean(dim=1))
-        std_loss = F.mse_loss(
-            pred_vec.std(dim=1, unbiased=False),
-            target_vec.std(dim=1, unbiased=False),
+        med_loss = F.mse_loss(
+            pred_vec.median(dim=1).values,
+            target_vec.median(dim=1).values,
         )
-        return w_loss + mean_loss + 0.5 * std_loss
+        return w_loss + 2.0 * med_loss
 
 
 def get_loss_weights(epoch, total_epochs=50):
     return {
-        "mmd_shape_1d": 4000.0,
+        "mmd_shape_1d": 3500.0,
         "radial": 80.0,
         "geometry_1d": 60.0,
-        "integral": 4000.0,
+        "integral": 5000.0,
         "mmd_physics": 80.0,
         "centroid": 100.0,
         "shape_anchor": 20.0,
         "transport": 200.0,
-        "identity": 40.0,
+        "identity": 50.0,
     }
 
 
@@ -649,22 +700,37 @@ def compute_cygno_loss(
     ).view(B, N, 8)
 
     L_integral = dist_match_loss(
-        pred_physics_feat[:, :, 0], target_physics_feat[:, :, 0], mode="mse", robust_outliers=False
+        pred_physics_feat[:, :, 0],
+        target_physics_feat[:, :, 0],
+        mode="mse",
+        robust_outliers=False,
     )
     L_length = dist_match_loss(
-        pred_physics_feat[:, :, 1], target_physics_feat[:, :, 1], mode="l1", robust_outliers=True
+        pred_physics_feat[:, :, 1],
+        target_physics_feat[:, :, 1],
+        mode="l1",
+        robust_outliers=True,
     )
     L_width = dist_match_loss(
-        pred_physics_feat[:, :, 2], target_physics_feat[:, :, 2], mode="l1", robust_outliers=True
+        pred_physics_feat[:, :, 2],
+        target_physics_feat[:, :, 2],
+        mode="l1",
+        robust_outliers=True,
     )
-    L_eccentricity = wasserstein_1d_loss(
-        pred_physics_feat[:, :, 6], target_physics_feat[:, :, 6], mode="l1"
+    L_eccentricity = dist_match_loss(
+        pred_physics_feat[:, :, 6],
+        target_physics_feat[:, :, 6],
+        mode="l1",
+        robust_outliers=True,
     )
     L_rel_peak = wasserstein_1d_loss(
         pred_physics_feat[:, :, 7], target_physics_feat[:, :, 7], mode="l1"
     )
     L_geometry_1d = (
-        1.5 * L_length + 2.5 * L_width + 0.5 * L_eccentricity + 2.0 * L_rel_peak
+        1.5 * L_length
+        + 2.5 * L_width
+        + 2.0 * L_eccentricity
+        + 2.0 * L_rel_peak
     )
 
     feat_mean = target_physics_feat.mean(dim=1, keepdim=True)
@@ -675,7 +741,6 @@ def compute_cygno_loss(
         pred_feat_norm, target_feat_norm, sigmas=(0.5, 1.0, 2.0)
     )
 
-    # Regolarizzazione di trasporto solo sulla forma normalizzata (non penalizza il guadagno globale!)
     if sim_n is not None:
         L_transport = F.mse_loss(pred_n, sim_n)
     else:
@@ -901,7 +966,7 @@ def _resolve_dataset_and_loader(
 
 
 def build_model_from_dataset(
-    dataset, device, loader=None, kernel_size=11, cond_dim=64, noise_dim=8
+    dataset, device, loader=None, kernel_size=11, cond_dim=64, noise_dim=2
 ):
     sim_mean, sim_std, data_mean, data_std = _compute_condition_stats(
         dataset, loader=loader
@@ -981,7 +1046,7 @@ def train_model(
     )
 
     print(
-        "=== TRAIN THE MODEL (v2.4 Stochastic Local Equivariant Transport) ==="
+        "=== TRAIN THE MODEL (v3.0 Physics-Informed GEM Saturation + 1:1 z) ==="
     )
     os.makedirs(os.path.dirname(os.path.abspath(outputfile)), exist_ok=True)
 
@@ -1153,7 +1218,7 @@ def test_training(
     test_preds = []
     test_datas = []
     test_gains = []
-    test_gammas = []
+    test_sats = []
     test_cond_sim_labels = []
     test_cond_data_labels = []
 
@@ -1192,7 +1257,7 @@ def test_training(
             test_preds.append(pred_img[0, 0].cpu())
             test_datas.append(F.relu(batch["data_images"][0, 0]).cpu())
             test_gains.append(out["gain"][0].item())
-            test_gammas.append(out["gamma"][0].item())
+            test_sats.append(out["sat_alpha"][0].item())
 
             sim_label = (
                 f"z={s_c[0, 0].item():.1f}cm,\n"
@@ -1246,7 +1311,7 @@ def test_training(
             test_preds[i], origin="lower", vmin=0, vmax=vmax, cmap=cmap
         )
         ax[1, i].set_title(
-            f"CORR (g={test_gains[i]:.2f}, $\\gamma$={test_gammas[i]:.2f})",
+            f"CORR (g={test_gains[i]:.2f}, s={test_sats[i]:+.2f})",
             fontsize=9.5,
         )
         ax[1, i].text(
