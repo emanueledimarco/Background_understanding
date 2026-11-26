@@ -1,6 +1,7 @@
 # Loads and treat the reconstruction tree data and simulation
 # test basic plotting with python -m data_reading.read_data
 
+import argparse
 from collections import defaultdict
 import concurrent.futures
 import hashlib
@@ -105,7 +106,7 @@ def process_single_file_task(
     return mapkey, isdata, chunk_path, root_file
 
 
-def read_data_and_save(conf):
+def read_data_and_save(conf, reuse_sim_from=None, out_pkl=None):
 
     with open("flow_configuration.yaml", "r") as stream:
         dictionary = yaml.load(stream, Loader)
@@ -124,35 +125,50 @@ def read_data_and_save(conf):
         target_cluster_variables,
     )
 
-    print(
-        "Now filling the datasets for the simulation and data. It applies the selection and converts them to panda DFs.  Since many files are involved, it takes time..."
-    )
-
     cachedir = "data/cache"
     chunks_dir = os.path.join(cachedir, "chunks")
     os.makedirs(chunks_dir, exist_ok=True)
+    if out_pkl is None:
+        out_pkl = os.path.join(cachedir, "cygno_clusters_dataset.pkl")
 
     sim_clusters_dict = defaultdict(list)
     data_clusters_dict = defaultdict(list)
 
     sim_map = dictionary["data_inputs"]["sim_map"]
     data_map = dictionary["data_inputs"]["data_map"]
-    maps = dict(zip(["sim", "data"], [sim_map, data_map]))
+
+    if reuse_sim_from is not None:
+        print(f"\nCaricamento dataset SIM esistente da: {reuse_sim_from}")
+        with open(reuse_sim_from, "rb") as f:
+            old_bundle = pickle.load(f)
+        sim_clusters_dict = old_bundle["sim"]
+        n_sim_loaded = sum(len(v) for v in sim_clusters_dict.values())
+        print(
+            f"SIM caricata: {len(sim_clusters_dict)} chiavi, {n_sim_loaded} cluster totali."
+        )
+        maps = {"data": data_map}
+    else:
+        print(
+            "Now filling the datasets for the simulation and data. It applies the selection and converts them to panda DFs.  Since many files are involved, it takes time..."
+        )
+        maps = {"sim": sim_map, "data": data_map}
 
     tasks = []
 
     for k, m in maps.items():
         with open(m) as f:
-            raw_map_dic = yaml.safe_load(f)
+            raw_map_dic = yaml.safe_load(f) or {}
 
             map_dic = {}
             for raw_k, v in raw_map_dic.items():
-                str_vals = raw_k.split(",")
+                if not v:  # gestisce chiavi con tutti i file commentati nel YAML
+                    continue
+                str_vals = str(raw_k).split(",")
                 mapkey = tuple(round(float(x), 4) for x in str_vals)
                 if mapkey in map_dic:
                     map_dic[mapkey].extend(v)
                 else:
-                    map_dic[mapkey] = v
+                    map_dic[mapkey] = list(v)
 
             isdata = k == "data"
             for mapkey, files in map_dic.items():
@@ -227,14 +243,30 @@ def read_data_and_save(conf):
     metadata["dataset_hash"] = hashlib.md5(str(metadata).encode()).hexdigest()
 
     dataset_bundle = {
-        "data": data_clusters_dict,
-        "sim": sim_clusters_dict,
+        "data": dict(data_clusters_dict),
+        "sim": dict(sim_clusters_dict),
         "metadata": metadata,
     }
 
-    os.makedirs(cachedir, exist_ok=True)
-    with open(f"{cachedir}/cygno_clusters_dataset.pkl", "wb") as f:
+    os.makedirs(os.path.dirname(os.path.abspath(out_pkl)), exist_ok=True)
+
+    # Se sovrascriviamo il file sorgente da cui abbiamo preso la SIM, facciamo prima un backup
+    if reuse_sim_from is not None and os.path.abspath(reuse_sim_from) == os.path.abspath(out_pkl):
+        backup_path = out_pkl.replace(".pkl", "_backup_sim.pkl")
+        if not os.path.exists(backup_path):
+            shutil.copy2(out_pkl, backup_path)
+            print(f"Backup di sicurezza salvato in: {backup_path}")
+
+    tmp_out = out_pkl + ".tmp"
+    with open(tmp_out, "wb") as f:
         pickle.dump(dataset_bundle, f, protocol=4)
+    os.replace(tmp_out, out_pkl)
+
+    print(
+        f"\nSalvato dataset aggiornato in {out_pkl}: "
+        f"SIM={metadata['stats']['n_clusters_sim']} clusters ({len(sim_clusters_dict)} chiavi), "
+        f"DATA={metadata['stats']['n_clusters_data']} clusters ({len(data_clusters_dict)} chiavi)"
+    )
 
 
 def inspect_cluster_set(clusters, name=""):
@@ -518,3 +550,34 @@ def debug_clusters_dataset(
                 )
 
     print("===========================================================\n")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Rigenera solo DATA dal YAML aggiornato e fa merge con la SIM esistente."
+    )
+    parser.add_argument(
+        "--configuration",
+        type=str,
+        default="configuration_limerun4_v2",
+        help="Nome configurazione da salvare nei metadata",
+    )
+    parser.add_argument(
+        "--sim-pkl",
+        type=str,
+        default="data/cache/cygno_clusters_dataset.pkl",
+        help="File .pkl esistente da cui estrarre la SIM",
+    )
+    parser.add_argument(
+        "--out-pkl",
+        type=str,
+        default="data/cache/cygno_clusters_dataset.pkl",
+        help="File .pkl di output unito (SIM vecchia + DATA nuova)",
+    )
+    args = parser.parse_args()
+
+    read_data_and_save(
+        conf=args.configuration,
+        reuse_sim_from=args.sim_pkl,
+        out_pkl=args.out_pkl,
+    )
